@@ -1,0 +1,55 @@
+pipeline:
+  - category: "io_handlers"
+    name: "pcd_loader"
+    params:
+      voxel_downsample_size: null
+
+  - category: "ground_segmentation"
+    name: "ransac"
+    params:
+      distance_threshold: 13.0
+
+  - category: "clustering"
+    name: "polar_pdbscan"
+    params:
+      eps: 18.0
+
+  - category: "reconstruction"
+    name: "convex_hull"
+    params:
+      min_cluster_size: 15
+
+  - category: "io_handlers"
+    name: "data_saver"
+    params:
+      output_dir: "../result/pointCloud/output"
+      save_targets:
+        # 1. 保存无地面点云
+        - attr: "non_ground_pcd"
+          suffix: "ngpcd"
+          type: "pcd"
+
+        # 2. 保存白模 Mesh
+        - attr: "mesh_result"
+          suffix: "hulls"
+          type: "mesh"
+
+#        # 3. 保存上色点云
+#        - attr: "colored_pcd"
+#          suffix: "colored"
+#          type: "pcd"
+
+  - category: "visualization"
+    name: "streaming_viewer"
+    params:
+      windows:
+        - name: "Real-time Hull Render"
+          target_attr: "mesh_result"
+          width: 1280
+          height: 720
+          bg_color: [0.1, 0.1, 0.1]
+          camera:
+            front: [-0.0, -1.0, 0.35]
+            lookat: [-17.5, 2213.0, -86.0]
+            up: [-0.0, 0.35, 1.0]
+            zoom: 0.7
