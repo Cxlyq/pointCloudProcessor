@@ -1,0 +1,14 @@
+parallel_dbscan_node:
+  ros__parameters:
+    # 话题配置
+    subscribe_topic: "/gs/non_ground_pointcloud"
+    publish_topic: "/clustering/clustered_pointcloud"
+
+    # 极坐标空间权重
+    r_weight: 3.0
+    theta_weight: 650.0
+    phi_weight: 600.0
+
+    # DBSCAN 算法参数
+    cluster_eps: 18.0
+    cluster_min_samples: 5
