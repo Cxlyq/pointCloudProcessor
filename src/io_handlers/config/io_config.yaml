@@ -1,0 +1,12 @@
+# 模拟雷达数据流节点的配置
+sim_lidar_data_flow_node:
+  ros__parameters:
+    dataset_dir: "/home/cx/Documents/codes/pointcloud_607/dataset/pointCloud/data1/City/01/dense"
+    publish_rate: 10.0
+    publish_topic: "/io/raw_pointcloud"
+    frame_id: "map"
+
+# 未来其他功能的配置预留 (示例)
+# some_other_io_node:
+#   ros__parameters:
+#     another_param: 123
