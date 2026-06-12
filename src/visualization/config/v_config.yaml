@@ -1,0 +1,30 @@
+visualization_node:
+  ros__parameters:
+    subscribe_topic: "/reconstruction/white_mesh"
+    # 定义需要开启的窗口 ID 列表
+    camera_ids: ["cam_front"]
+#    camera_ids: ["cam_front", "cam_top"]
+
+    # --- 1号机位：正面视角 ---
+    cam_front:
+      name: "Real-time Render - Front View"
+      width: 800
+      height: 600
+      background_color: [0.1, 0.1, 0.1]
+      point_size: 2.0
+      front: [-0.0, -1.0, 0.35]
+      lookat: [-17.5, 2213.0, -86.0]
+      up: [-0.0, 0.35, 1.0]
+      zoom: 0.7
+
+#    # --- 2号机位：俯视/上帝视角 (示例) ---
+#    cam_top:
+#      name: "Real-time Render - Top View"
+#      width: 800
+#      height: 600
+#      background_color: [0.2, 0.2, 0.2]
+#      point_size: 2.0
+#      front: [0.0, 0.0, 1.0]
+#      lookat: [-17.5, 2213.0, -86.0]
+#      up: [0.0, 1.0, 0.0]
+#      zoom: 1.2
