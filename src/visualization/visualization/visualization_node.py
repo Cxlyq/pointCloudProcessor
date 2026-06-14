@@ -56,6 +56,11 @@ class VisualizationNode(Node):
             opt = vis.get_render_option()
             opt.background_color = np.asarray(cam_config['bg_color'])
             opt.point_size = cam_config['pt_size']
+            opt.light_on = True  # 强制开启光照计算
+            opt.mesh_show_wireframe = True  # 开启网格线框，立刻看清多边形轮廓
+            opt.line_width = 1.5  # 线框的粗细 (部分系统可能不生效，取决于底层 OpenGL)
+            opt.mesh_show_back_face = True  # 渲染背面，防止法线朝内导致的异常暗面
+            opt.mesh_shade_option = o3d.visualization.MeshShadeOption.Color  # 确保基于顶点颜色进行着色
 
             self.visualizers.append({
                 'config': cam_config,
