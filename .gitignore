@@ -2,5 +2,9 @@
 build/
 install/
 log/
+__pycache__/
+dataset/
+
 *.pth
-__pycache__
+*.tmp
+*.log
