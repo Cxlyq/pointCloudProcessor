@@ -1,0 +1,10 @@
+reconstruction_node:
+  ros__parameters:
+    # 订阅的话题
+    sub_ground_topic: "/gs/ground_pointcloud"
+    sub_cluster_topic: "/clustering/clustered_pointcloud"
+    # 发布的话题
+    pub_mesh_topic: "/reconstruction/white_mesh"
+
+    # 重建参数
+    min_cluster_size: 15
