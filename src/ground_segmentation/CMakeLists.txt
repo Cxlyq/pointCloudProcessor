@@ -1,8 +1,8 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.10)
 project(ground_segmentation)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic -std=c++17 -O3)
 endif()
 
 # find dependencies
@@ -13,13 +13,22 @@ find_package(Open3D REQUIRED)
 
 # 确保能找到源码编译并安装在 /usr/local 下的 Open3D
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+
 add_executable(ransac_node src/ransac_node.cpp)
+ament_target_dependencies(ransac_node rclcpp pc_msgs)
 target_include_directories(ransac_node PUBLIC ${Open3D_INCLUDE_DIRS})
 target_link_libraries(ransac_node ${Open3D_LIBRARIES})
-ament_target_dependencies(ransac_node rclcpp pc_msgs)
-
 install(TARGETS
         ransac_node
+        DESTINATION lib/${PROJECT_NAME}
+)
+
+add_executable(gmz_node src/gmz_node.cpp)
+ament_target_dependencies(gmz_node rclcpp pc_msgs)
+target_include_directories(gmz_node PUBLIC ${Open3D_INCLUDE_DIRS})
+target_link_libraries(gmz_node ${Open3D_LIBRARIES})
+install(TARGETS
+        gmz_node
         DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -28,14 +37,6 @@ install(DIRECTORY
         config
         DESTINATION share/${PROJECT_NAME}
 )
-
-ament_target_dependencies(
-  ransac_node
-  "rclcpp"
-  "pc_msgs"
-)
-
-
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

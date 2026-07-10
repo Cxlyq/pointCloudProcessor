@@ -9,3 +9,14 @@ ransac_node:
     distance_threshold: 13.0
     ransac_n: 3
     num_iterations: 100
+
+gmz_node:
+  ros__parameters:
+    # 话题配置
+    subscribe_topic: "/io/raw_pointcloud"
+    publish_ground_topic: "/gs/ground_pointcloud"
+    publish_non_ground_topic: "/gs/non_ground_pointcloud"
+
+    # GMZ 算法参数
+    grid_size: 20.0
+    height_threshold: 0.8

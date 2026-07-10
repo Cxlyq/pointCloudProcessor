@@ -10,33 +10,49 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(pc_msgs REQUIRED)
-
+find_package(Open3D REQUIRED)
 # 查找 Eigen3
 find_package(Eigen3 REQUIRED)
 
 # 确保能找到安装在 /usr/local 下的 Open3D
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
-find_package(Open3D REQUIRED)
+
 
 add_executable(reconstruction_node src/reconstruction_node.cpp)
-target_include_directories(reconstruction_node PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(
+        reconstruction_node
+        "rclcpp"
+        "message_filters"
+        "pc_msgs"
+)
 target_include_directories(reconstruction_node PUBLIC
         ${Open3D_INCLUDE_DIRS}
         ${EIGEN3_INCLUDE_DIRS}
 )
-target_compile_features(reconstruction_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 target_link_libraries(reconstruction_node ${Open3D_LIBRARIES})
-ament_target_dependencies(
-  reconstruction_node
-  "rclcpp"
-  "message_filters"
-  "pc_msgs"
+target_compile_features(reconstruction_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+install(TARGETS
+        reconstruction_node
+        DESTINATION lib/${PROJECT_NAME}
 )
 
-install(TARGETS reconstruction_node
-  DESTINATION lib/${PROJECT_NAME})
+
+add_executable(reconstruction_poisson_node src/reconstruction_poisson_node.cpp)
+ament_target_dependencies(
+        reconstruction_poisson_node
+        "rclcpp"
+        "pc_msgs"
+        "message_filters"
+)
+target_include_directories(reconstruction_poisson_node PUBLIC
+        ${Open3D_INCLUDE_DIRS}
+        ${EIGEN3_INCLUDE_DIRS}
+)
+target_link_libraries(reconstruction_poisson_node ${Open3D_LIBRARIES})
+install(TARGETS
+        reconstruction_poisson_node
+        DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY
         launch
