@@ -33,11 +33,13 @@ public:
         this->declare_parameter<double>("publish_rate", 10.0);
         this->declare_parameter<std::string>("publish_topic", "/io/raw_pointcloud");
         this->declare_parameter<std::string>("frame_id", "map");
+        this->declare_parameter<bool>("is_loop", false);
 
         dataset_dir_ = this->get_parameter("dataset_dir").as_string();
         publish_rate_ = this->get_parameter("publish_rate").as_double();
         publish_topic_ = this->get_parameter("publish_topic").as_string();
         frame_id_ = this->get_parameter("frame_id").as_string();
+        is_loop_ = this->get_parameter("is_loop").as_bool();
 
         // 2. 搜索点云文件 (等价于 Python 的 glob)
         if (dataset_dir_.empty() || !fs::exists(dataset_dir_)) {
@@ -151,12 +153,20 @@ private:
         RCLCPP_INFO(this->get_logger(), "[*] %s has been published | Point: %zu", frame.file_name.c_str(), frame.num_points);
 
         current_idx_++;
+        if (is_loop_)
+        {
+            if (current_idx_ >= frames_data_.size())
+            {
+                current_idx_ = 0;
+            }
+        }
     }
 
     std::string dataset_dir_;
     double publish_rate_;
     std::string publish_topic_;
     std::string frame_id_;
+    bool is_loop_;
 
     std::vector<std::string> ply_files_;
     std::vector<FrameData> frames_data_;

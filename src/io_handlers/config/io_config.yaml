@@ -5,6 +5,7 @@ sim_lidar_data_flow_node:
     publish_rate: 2.0
     publish_topic: "/io/raw_pointcloud"
     frame_id: "map"
+    is_loop: true
 
 # 未来其他功能的配置预留 (示例)
 # some_other_io_node:
