@@ -94,11 +94,12 @@ private:
             min_y = std::min(min_y, pt.y());
         }
 
-        // 3.2 第一遍遍历：找到每个网格的最低点 Z 值
+        // 3.2 第一遍遍历：找到每个网格的最低点索引 (用于提取最稀疏待重建地面)
         // 使用 uint64_t 存储 2D 网格的联合哈希键
-        std::unordered_map<uint64_t, double> grid_min_z_map;
+        std::unordered_map<uint64_t, size_t> grid_min_pt_idx_map;
 
-        for (const auto& pt : pcd->points_) {
+        for (size_t i = 0; i < pcd->points_.size(); ++i) {
+            const auto& pt = pcd->points_[i];
             // 由于减去了最小值，坐标必为非负，转为 uint32_t 是安全的
             uint32_t grid_x = static_cast<uint32_t>(std::floor((pt.x() - min_x) / grid_size_));
             uint32_t grid_y = static_cast<uint32_t>(std::floor((pt.y() - min_y) / grid_size_));
@@ -106,23 +107,33 @@ private:
             // 将 x 和 y 拼接成一个 64 位唯一的 key
             uint64_t key = (static_cast<uint64_t>(grid_x) << 32) | grid_y;
 
-            auto it = grid_min_z_map.find(key);
-            if (it == grid_min_z_map.end()) {
-                grid_min_z_map[key] = pt.z();
+            auto it = grid_min_pt_idx_map.find(key);
+            if (it == grid_min_pt_idx_map.end()) {
+                grid_min_pt_idx_map[key] = i; // 记录最低点的索引
             } else {
-                it->second = std::min(it->second, pt.z());
+                if (pt.z() < pcd->points_[it->second].z()) {
+                    it->second = i; // 更新为更低点的索引
+                }
             }
         }
 
-        // 3.3 第二遍遍历：根据最低点 + 阈值划分地面与非地面点
-        auto ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
+        // 提取待重建地面点 (每个网格唯一的最低点)
+        auto sparse_ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
+        sparse_ground_pcd->points_.reserve(grid_min_pt_idx_map.size());
+        if (has_colors) sparse_ground_pcd->colors_.reserve(grid_min_pt_idx_map.size());
+
+        for (const auto& pair : grid_min_pt_idx_map) {
+            size_t idx = pair.second;
+            sparse_ground_pcd->points_.push_back(pcd->points_[idx]);
+            if (has_colors) sparse_ground_pcd->colors_.push_back(pcd->colors_[idx]);
+        }
+
+        // 3.3 第二遍遍历：根据最低点 + 阈值剔除所有附着在地面的点，只保留悬浮的非地面点用于聚类
         auto non_ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
 
         // 预分配内存，提升速度
-        ground_pcd->points_.reserve(num_points);
         non_ground_pcd->points_.reserve(num_points);
         if (has_colors) {
-            ground_pcd->colors_.reserve(num_points);
             non_ground_pcd->colors_.reserve(num_points);
         }
 
@@ -133,13 +144,10 @@ private:
             uint32_t grid_y = static_cast<uint32_t>(std::floor((pt.y() - min_y) / grid_size_));
             uint64_t key = (static_cast<uint64_t>(grid_x) << 32) | grid_y;
 
-            double min_z = grid_min_z_map[key];
+            double min_z = pcd->points_[grid_min_pt_idx_map[key]].z();
 
-            // 判断是否在厚度阈值范围内
-            if (pt.z() <= (min_z + height_threshold_)) {
-                ground_pcd->points_.push_back(pt);
-                if (has_colors) ground_pcd->colors_.push_back(pcd->colors_[i]);
-            } else {
+            // 判断是否在厚度阈值范围内，如果不属于地面厚度区间，则是纯粹的非地面点
+            if (pt.z() > (min_z + height_threshold_)) {
                 non_ground_pcd->points_.push_back(pt);
                 if (has_colors) non_ground_pcd->colors_.push_back(pcd->colors_[i]);
             }
@@ -151,21 +159,21 @@ private:
         }
 
         // 4. 序列化：Open3D 点云转 ROS 2 消息并发布
-        // 发布地面点云
-        if (!ground_pcd->points_.empty()) {
+        // 发布稀疏地面点云 (加速后续泊松重建)
+        if (!sparse_ground_pcd->points_.empty()) {
             auto ground_msg = pc_msgs::msg::O3DPointCloud();
             ground_msg.header = msg->header;
 
-            ground_msg.points.reserve(ground_pcd->points_.size() * 3);
-            for (const auto& point : ground_pcd->points_) {
+            ground_msg.points.reserve(sparse_ground_pcd->points_.size() * 3);
+            for (const auto& point : sparse_ground_pcd->points_) {
                 ground_msg.points.push_back(static_cast<float>(point.x()));
                 ground_msg.points.push_back(static_cast<float>(point.y()));
                 ground_msg.points.push_back(static_cast<float>(point.z()));
             }
 
             if (has_colors) {
-                ground_msg.colors.reserve(ground_pcd->colors_.size() * 3);
-                for (const auto& color : ground_pcd->colors_) {
+                ground_msg.colors.reserve(sparse_ground_pcd->colors_.size() * 3);
+                for (const auto& color : sparse_ground_pcd->colors_) {
                     ground_msg.colors.push_back(static_cast<float>(color.x()));
                     ground_msg.colors.push_back(static_cast<float>(color.y()));
                     ground_msg.colors.push_back(static_cast<float>(color.z()));
@@ -199,8 +207,8 @@ private:
         auto end_time = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
-        RCLCPP_INFO(this->get_logger(), "[*] GMZ Segmented! Ground: %zu, Non-Ground: %zu. Time: %.2f ms",
-                    ground_pcd->points_.size(), non_ground_pcd->points_.size(), elapsed_ms);
+        RCLCPP_INFO(this->get_logger(), "[*] GMZ Segmented! Ground: %zu, Non-Ground: %zu, Waiting for reconstruction: %zu. Time: %.2f ms",
+                    pcd->points_.size()-non_ground_pcd->points_.size(), non_ground_pcd->points_.size(), sparse_ground_pcd->points_.size(), elapsed_ms);
     }
 
     // 算法参数
