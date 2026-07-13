@@ -54,6 +54,24 @@ install(TARGETS
         DESTINATION lib/${PROJECT_NAME}
 )
 
+add_executable(reconstruction_g_dln_ng_obb_node src/reconstruction_g_dln_ng_obb_node.cpp)
+ament_target_dependencies(
+        reconstruction_g_dln_ng_obb_node
+        "rclcpp"
+        "message_filters"
+        "pc_msgs"
+)
+target_include_directories(reconstruction_g_dln_ng_obb_node PUBLIC
+        ${Open3D_INCLUDE_DIRS}
+        ${EIGEN3_INCLUDE_DIRS}
+)
+target_link_libraries(reconstruction_g_dln_ng_obb_node ${Open3D_LIBRARIES})
+target_compile_features(reconstruction_g_dln_ng_obb_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+install(TARGETS
+        reconstruction_g_dln_ng_obb_node
+        DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY
         launch
         config
