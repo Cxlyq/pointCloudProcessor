@@ -106,20 +106,24 @@ private:
                 );
             }
 
-            double voxel_size = 10.0;
-            auto downsampled_ground = ground_pcd->VoxelDownSample(voxel_size);
 
             try {
                 // 1.1 计算法线
-                downsampled_ground->EstimateNormals(
+                ground_pcd->EstimateNormals(
                     open3d::geometry::KDTreeSearchParamHybrid(normal_radius_, normal_max_nn_)
                 );
 
                 // 1.2 法线朝向对齐到 Z 轴正方向
-                downsampled_ground->OrientNormalsToAlignWithDirection(Eigen::Vector3d(0.0, 0.0, 1.0));
+                ground_pcd->OrientNormalsToAlignWithDirection(Eigen::Vector3d(0.0, 0.0, 1.0));
 
                 // 1.3 泊松重建 (返回网格和密度数组)
-                auto poisson_result = open3d::geometry::TriangleMesh::CreateFromPointCloudPoisson(*downsampled_ground, poisson_depth_);
+                auto poisson_result = open3d::geometry::TriangleMesh::CreateFromPointCloudPoisson(*ground_pcd,
+                    poisson_depth_,
+                    0,     // width (设为0由算法自动推断)
+                    1.1,   // scale (默认包围盒缩放比例)
+                    true,  // linear_fit (开启线性拟合加速)
+                    -1     // n_threads (使用所有可用 CPU 核心)
+                );
                 auto terrain_mesh = std::get<0>(poisson_result);
                 auto densities = std::get<1>(poisson_result);
 
@@ -141,7 +145,7 @@ private:
                 }
 
                 // 1.5 包围盒裁剪 (死死限制在原点云范围内)
-                auto bbox = downsampled_ground->GetAxisAlignedBoundingBox();
+                auto bbox = ground_pcd->GetAxisAlignedBoundingBox();
                 terrain_mesh = terrain_mesh->Crop(bbox);
 
                 // 1.6 刷新法线并赋色
