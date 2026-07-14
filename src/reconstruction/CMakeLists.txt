@@ -37,20 +37,20 @@ install(TARGETS
 )
 
 
-add_executable(reconstruction_poisson_node src/reconstruction_poisson_node.cpp)
+add_executable(reconstruction_g_poisson_ng_obb_node src/reconstruction_g_poisson_ng_obb_node.cpp)
 ament_target_dependencies(
-        reconstruction_poisson_node
+        reconstruction_g_poisson_ng_obb_node
         "rclcpp"
         "pc_msgs"
         "message_filters"
 )
-target_include_directories(reconstruction_poisson_node PUBLIC
+target_include_directories(reconstruction_g_poisson_ng_obb_node PUBLIC
         ${Open3D_INCLUDE_DIRS}
         ${EIGEN3_INCLUDE_DIRS}
 )
-target_link_libraries(reconstruction_poisson_node ${Open3D_LIBRARIES})
+target_link_libraries(reconstruction_g_poisson_ng_obb_node ${Open3D_LIBRARIES})
 install(TARGETS
-        reconstruction_poisson_node
+        reconstruction_g_poisson_ng_obb_node
         DESTINATION lib/${PROJECT_NAME}
 )
 

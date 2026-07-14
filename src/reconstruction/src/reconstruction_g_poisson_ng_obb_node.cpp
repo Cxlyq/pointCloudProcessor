@@ -29,14 +29,14 @@
 using std::placeholders::_1;
 using std::placeholders::_2;
 
-class ReconstructionPoissonNode : public rclcpp::Node {
+class ReconstructionPoissonOBBNode : public rclcpp::Node {
 public:
     // 定义同步策略：近似时间同步
     typedef message_filters::sync_policies::ApproximateTime<
         pc_msgs::msg::O3DPointCloud,
         pc_msgs::msg::ClusteredPointCloud> SyncPolicy;
 
-    ReconstructionPoissonNode() : Node("reconstruction_poisson_node") {
+    ReconstructionPoissonOBBNode() : Node("reconstruction_poisson_node") {
         // 1. 声明并读取参数
         this->declare_parameter<std::string>("sub_ground_topic", "/gs/ground_pointcloud");
         this->declare_parameter<std::string>("sub_cluster_topic", "/clustering/clustered_pointcloud");
@@ -67,7 +67,7 @@ public:
 
         // 队列大小设为 10
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), ground_sub_, cluster_sub_);
-        sync_->registerCallback(std::bind(&ReconstructionPoissonNode::sync_callback, this, _1, _2));
+        sync_->registerCallback(std::bind(&ReconstructionPoissonOBBNode::sync_callback, this, _1, _2));
 
         // 3. 创建发布者
         publisher_ = this->create_publisher<pc_msgs::msg::O3DMesh>(pub_m_topic, 10);
@@ -293,7 +293,7 @@ private:
 
 int main(int argc, char * argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<ReconstructionPoissonNode>();
+    auto node = std::make_shared<ReconstructionPoissonOBBNode>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

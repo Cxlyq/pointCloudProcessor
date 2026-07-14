@@ -8,7 +8,7 @@ reconstruction_node:
     # 重建参数
     min_cluster_size: 15
 
-reconstruction_poisson_node:
+reconstruction_g_poisson_ng_obb_node:
   ros__parameters:
     # 订阅的话题
     sub_ground_topic: "/gs/ground_pointcloud"
