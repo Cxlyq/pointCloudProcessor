@@ -1,8 +1,5 @@
 //
-// Created by cx on 7/7/26.
-//
-//
-// Created for hybrid reconstruction (Poisson for ground, ConvexHull/OBB for clusters).
+// Created by cx on 7/14/26.
 //
 #include <chrono>
 #include <memory>
@@ -29,14 +26,14 @@
 using std::placeholders::_1;
 using std::placeholders::_2;
 
-class ReconstructionPoissonQHNode : public rclcpp::Node {
+class ReconstructionPoissonOBBNode : public rclcpp::Node {
 public:
     // 定义同步策略：近似时间同步
     typedef message_filters::sync_policies::ApproximateTime<
         pc_msgs::msg::O3DPointCloud,
         pc_msgs::msg::ClusteredPointCloud> SyncPolicy;
 
-    ReconstructionPoissonQHNode() : Node("reconstruction_g_poisson_ng_qh_node") {
+    ReconstructionPoissonOBBNode() : Node("reconstruction_g_poisson_ng_obb_node") {
         // 1. 声明并读取参数
         this->declare_parameter<std::string>("sub_ground_topic", "/gs/ground_pointcloud");
         this->declare_parameter<std::string>("sub_cluster_topic", "/clustering/clustered_pointcloud");
@@ -67,7 +64,7 @@ public:
 
         // 队列大小设为 10
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), ground_sub_, cluster_sub_);
-        sync_->registerCallback(std::bind(&ReconstructionPoissonQHNode::sync_callback, this, _1, _2));
+        sync_->registerCallback(std::bind(&ReconstructionPoissonOBBNode::sync_callback, this, _1, _2));
 
         // 3. 创建发布者
         publisher_ = this->create_publisher<pc_msgs::msg::O3DMesh>(pub_m_topic, 10);
@@ -161,7 +158,7 @@ private:
         }
 
         // =========================================================
-        // 阶段 2: 非地面聚类块 凸包/OBB 重建
+        // 阶段 2: 非地面聚类块 OBB 重建
         // =========================================================
         if (cluster_points_count > 0) {
             auto cluster_pcd_full = std::make_shared<open3d::geometry::PointCloud>();
@@ -193,31 +190,20 @@ private:
 
                 auto cluster_pcd = cluster_pcd_full->SelectByIndex(cluster_indices);
 
+                // 使用 OBB 重建
                 try {
-                    // 2.1 尝试使用 3D 凸包
-                    auto result = cluster_pcd->ComputeConvexHull();
-                    auto hull_mesh = std::get<0>(result);
+                    auto obb = cluster_pcd->GetOrientedBoundingBox();
+                    auto obb_mesh = open3d::geometry::TriangleMesh::CreateFromOrientedBoundingBox(obb);
 
-                    hull_mesh->ComputeVertexNormals();
-                    hull_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
+                    obb_mesh->ComputeVertexNormals();
+                    obb_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
 
-                    *combined_mesh += *hull_mesh;
+                    *combined_mesh += *obb_mesh;
                     valid_hull_count++;
-                } catch (const std::exception& e) {
-                    // 2.2 降级策略：凸包失败（如纯平面），使用 OBB
-                    try {
-                        auto obb = cluster_pcd->GetOrientedBoundingBox();
-                        auto obb_mesh = open3d::geometry::TriangleMesh::CreateFromOrientedBoundingBox(obb);
-
-                        obb_mesh->ComputeVertexNormals();
-                        obb_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
-
-                        *combined_mesh += *obb_mesh;
-                        valid_hull_count++;
-                    } catch (...) {
-                        // 彻底失败，忽略
-                    }
+                } catch (...) {
+                    // 失败，忽略
                 }
+
             }
         }
 
@@ -293,7 +279,7 @@ private:
 
 int main(int argc, char * argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<ReconstructionPoissonQHNode>();
+    auto node = std::make_shared<ReconstructionPoissonOBBNode>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

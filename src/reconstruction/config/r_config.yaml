@@ -35,3 +35,18 @@ reconstruction_g_dln_ng_qh_node:
     # DLN重建（地面）特有参数
     max_edge_length: 1080.0
 
+
+reconstruction_g_poisson_ng_obb_node:
+  ros__parameters:
+    # 订阅的话题
+    sub_ground_topic: "/gs/ground_pointcloud"
+    sub_cluster_topic: "/clustering/clustered_pointcloud"
+    # 发布的话题
+    pub_mesh_topic: "/reconstruction/white_mesh"
+    # 聚类非地面物体的过滤阈值
+    min_cluster_size: 15
+    # 泊松重建（地面）特有参数
+    poisson_depth: 6
+    density_quantile: 0.06
+    normal_radius: 20.0
+    normal_max_nn: 15
