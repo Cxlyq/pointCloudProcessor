@@ -37,38 +37,38 @@ install(TARGETS
 )
 
 
-add_executable(reconstruction_g_poisson_ng_obb_node src/reconstruction_g_poisson_ng_obb_node.cpp)
+add_executable(reconstruction_g_poisson_ng_qh_node src/reconstruction_g_poisson_ng_qh_node.cpp)
 ament_target_dependencies(
-        reconstruction_g_poisson_ng_obb_node
+        reconstruction_g_poisson_ng_qh_node
         "rclcpp"
         "pc_msgs"
         "message_filters"
 )
-target_include_directories(reconstruction_g_poisson_ng_obb_node PUBLIC
+target_include_directories(reconstruction_g_poisson_ng_qh_node PUBLIC
         ${Open3D_INCLUDE_DIRS}
         ${EIGEN3_INCLUDE_DIRS}
 )
-target_link_libraries(reconstruction_g_poisson_ng_obb_node ${Open3D_LIBRARIES})
+target_link_libraries(reconstruction_g_poisson_ng_qh_node ${Open3D_LIBRARIES})
 install(TARGETS
-        reconstruction_g_poisson_ng_obb_node
+        reconstruction_g_poisson_ng_qh_node
         DESTINATION lib/${PROJECT_NAME}
 )
 
-add_executable(reconstruction_g_dln_ng_obb_node src/reconstruction_g_dln_ng_obb_node.cpp)
+add_executable(reconstruction_g_dln_ng_qh_node src/reconstruction_g_dln_ng_qh_node.cpp)
 ament_target_dependencies(
-        reconstruction_g_dln_ng_obb_node
+        reconstruction_g_dln_ng_qh_node
         "rclcpp"
         "message_filters"
         "pc_msgs"
 )
-target_include_directories(reconstruction_g_dln_ng_obb_node PUBLIC
+target_include_directories(reconstruction_g_dln_ng_qh_node PUBLIC
         ${Open3D_INCLUDE_DIRS}
         ${EIGEN3_INCLUDE_DIRS}
 )
-target_link_libraries(reconstruction_g_dln_ng_obb_node ${Open3D_LIBRARIES})
-target_compile_features(reconstruction_g_dln_ng_obb_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+target_link_libraries(reconstruction_g_dln_ng_qh_node ${Open3D_LIBRARIES})
+target_compile_features(reconstruction_g_dln_ng_qh_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 install(TARGETS
-        reconstruction_g_dln_ng_obb_node
+        reconstruction_g_dln_ng_qh_node
         DESTINATION lib/${PROJECT_NAME}
 )
 

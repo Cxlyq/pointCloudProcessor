@@ -13,15 +13,15 @@ def generate_launch_description():
     )
 
     # 启动新的混合重建节点
-    reconstruction_poisson_node = Node(
+    reconstruction_g_poisson_ng_qh_node = Node(
         package=package_name,
-        executable='reconstruction_g_poisson_ng_obb_node', # 需在 CMakeLists 中配置同名执行文件
-        name='reconstruction_g_poisson_ng_obb_node',       # 对应 yaml 中的新建命名空间
+        executable='reconstruction_g_poisson_ng_qh_node', # 需在 CMakeLists 中配置同名执行文件
+        name='reconstruction_g_poisson_ng_qh_node',       # 对应 yaml 中的新建命名空间
         parameters=[config_file_path],
         output='screen',
         emulate_tty=True
     )
 
     return LaunchDescription([
-        reconstruction_poisson_node
+        reconstruction_g_poisson_ng_qh_node
     ])
