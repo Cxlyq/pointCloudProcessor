@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cmath>
+#include <filesystem>
 
 #include "rclcpp/rclcpp.hpp"
 // 引入 message_filters 实现时间同步
@@ -48,6 +49,12 @@ public:
         this->declare_parameter<int>("normal_max_nn", 30);
         this->declare_parameter<double>("density_quantile", 0.06);
 
+        // 保存白模参数
+        this->declare_parameter<std::string>("data_saved_dir", "");
+        this->declare_parameter<bool>("enable_terrain_mesh_saving", false);
+        this->declare_parameter<bool>("enable_architecture_mesh_saving", false);
+        this->declare_parameter<bool>("enable_combined_mesh_saving", false);
+
         auto sub_g_topic = this->get_parameter("sub_ground_topic").as_string();
         auto sub_c_topic = this->get_parameter("sub_cluster_topic").as_string();
         auto pub_m_topic = this->get_parameter("pub_mesh_topic").as_string();
@@ -57,6 +64,24 @@ public:
         normal_radius_ = this->get_parameter("normal_radius").as_double();
         normal_max_nn_ = this->get_parameter("normal_max_nn").as_int();
         density_quantile_ = this->get_parameter("density_quantile").as_double();
+
+        data_saved_dir_ = this->get_parameter("data_saved_dir").as_string();
+        enable_terrain_mesh_saving_ = this->get_parameter("enable_terrain_mesh_saving").as_bool();
+        enable_architecture_mesh_saving_ = this->get_parameter("enable_architecture_mesh_saving").as_bool();
+        enable_combined_mesh_saving_ = this->get_parameter("enable_combined_mesh_saving").as_bool();
+
+        // 如果开启了保存功能且路径不为空，检查并创建保存文件夹
+        bool need_saving = enable_terrain_mesh_saving_ || enable_architecture_mesh_saving_ || enable_combined_mesh_saving_;
+        if (need_saving && !data_saved_dir_.empty()) {
+            // 确保路径以斜杠结尾
+            if (data_saved_dir_.back() != '/' && data_saved_dir_.back() != '\\') {
+                data_saved_dir_ += "/";
+            }
+            if (!std::filesystem::exists(data_saved_dir_)) {
+                std::filesystem::create_directories(data_saved_dir_);
+                RCLCPP_INFO(this->get_logger(), "[+] Created mesh saving directory: %s", data_saved_dir_.c_str());
+            }
+        }
 
         // 2. 创建消息同步订阅器
         ground_sub_.subscribe(this, sub_g_topic);
@@ -86,6 +111,9 @@ private:
 
         // 最终要拼接在一起的总 Mesh
         auto combined_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
+        auto architecture_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
+        std::shared_ptr<open3d::geometry::TriangleMesh> final_terrain_mesh = nullptr;
+
         int valid_hull_count = 0;
         bool ground_reconstructed = false;
 
@@ -152,6 +180,9 @@ private:
                 *combined_mesh += *terrain_mesh;
                 ground_reconstructed = true;
                 valid_hull_count++;
+
+                // 保存地面模型指针供后续保存使用
+                final_terrain_mesh = terrain_mesh;
             } catch (const std::exception& e) {
                 RCLCPP_WARN(this->get_logger(), "[!] Ground Poisson Reconstruction failed: %s", e.what());
             }
@@ -198,17 +229,47 @@ private:
                     obb_mesh->ComputeVertexNormals();
                     obb_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
 
-                    *combined_mesh += *obb_mesh;
+                    *architecture_mesh += *obb_mesh;
                     valid_hull_count++;
                 } catch (...) {
                     // 失败，忽略
                 }
-
+            }
+            if (!architecture_mesh->vertices_.empty()) {
+                *combined_mesh += *architecture_mesh;
             }
         }
 
         // =========================================================
-        // 阶段 3: 序列化为自定义 ROS 2 消息并发布
+        // 阶段 3: 本地文件保存 (.ply)
+        // =========================================================
+        if (!data_saved_dir_.empty()) {
+            // 利用 ROS 消息时间戳作为文件名唯一标识
+            std::string timestamp = std::to_string(ground_msg->header.stamp.sec) + "_" +
+                                    std::to_string(ground_msg->header.stamp.nanosec);
+
+            // 保存地面白模
+            if (enable_terrain_mesh_saving_ && final_terrain_mesh && !final_terrain_mesh->vertices_.empty()) {
+                std::string file_path = data_saved_dir_ + "terrain_" + timestamp + ".ply";
+                open3d::io::WriteTriangleMesh(file_path, *final_terrain_mesh);
+            }
+
+            // 保存建筑白模
+            if (enable_architecture_mesh_saving_ && !architecture_mesh->vertices_.empty()) {
+                std::string file_path = data_saved_dir_ + "architecture_" + timestamp + ".ply";
+                open3d::io::WriteTriangleMesh(file_path, *architecture_mesh);
+            }
+
+            // 保存合并后的总白模
+            if (enable_combined_mesh_saving_ && !combined_mesh->vertices_.empty()) {
+                std::string file_path = data_saved_dir_ + "combined_" + timestamp + ".ply";
+                open3d::io::WriteTriangleMesh(file_path, *combined_mesh);
+            }
+        }
+
+
+        // =========================================================
+        // 阶段 4: 序列化为自定义 ROS 2 消息并发布
         // =========================================================
         if (combined_mesh->vertices_.empty()) {
             RCLCPP_WARN(this->get_logger(), "[?] No valid mesh generated. Scaped publish.");
@@ -269,6 +330,12 @@ private:
     double normal_radius_;
     int normal_max_nn_;
     double density_quantile_;
+
+    // 白模保存参数
+    std::string data_saved_dir_;
+    bool enable_terrain_mesh_saving_;
+    bool enable_architecture_mesh_saving_;
+    bool enable_combined_mesh_saving_;
 
     // ROS 2 对象
     message_filters::Subscriber<pc_msgs::msg::O3DPointCloud> ground_sub_;
