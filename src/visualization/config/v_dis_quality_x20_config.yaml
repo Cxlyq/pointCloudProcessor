@@ -1,0 +1,26 @@
+visualization_node:
+  ros__parameters:
+    subscribe_topic: "/reconstruction/white_mesh"
+    camera_ids: ["cam_front"]
+
+    # Quality comparison profile: keep single-direction ULTRAFAST DIS, but
+    # calculate flow at half resolution and insert 19 virtual frames.
+    interpolation_enabled: true
+    interpolation_intermediate_frames: 19
+    interpolation_flow_scale: 0.5
+    interpolation_dis_preset: "ultrafast"
+    interpolation_bidirectional_flow: false
+    interpolation_lock_camera: true
+    interpolation_show_source_window: false
+    interpolation_window_suffix: " - DIS Quality x20"
+
+    cam_front:
+      name: "Real-time Render - Front View"
+      width: 800
+      height: 600
+      background_color: [0.1, 0.1, 0.1]
+      point_size: 2.0
+      front: [-0.0, -1.0, 0.35]
+      lookat: [-17.5, 2213.0, -86.0]
+      up: [-0.0, 0.35, 1.0]
+      zoom: 0.7
