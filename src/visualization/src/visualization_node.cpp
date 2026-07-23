@@ -82,12 +82,15 @@ struct CamConfig {
     double zoom;
     bool is_first_frame = true;
     std::shared_ptr<open3d::visualization::Visualizer> vis;
+    std::shared_ptr<open3d::geometry::TriangleMesh> interpolation_render_mesh;
     std::string interpolation_window_name;
     std::unique_ptr<pointcloud_visualization::DisFrameInterpolator> interpolator;
     cv::Mat displayed_interpolated_frame;
     std::chrono::steady_clock::time_point display_measurement_started_at;
     std::chrono::steady_clock::time_point last_displayed_frame_at;
     std::size_t displayed_frames_in_measurement = 0;
+    double imshow_time_sum_ms = 0.0;
+    double imshow_time_max_ms = 0.0;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -97,12 +100,11 @@ public:
         this->declare_parameter<std::string>("subscribe_topic", "/reconstruction/white_mesh");
         this->declare_parameter<std::vector<std::string>>("camera_ids", {"cam_front"});
         this->declare_parameter<bool>("interpolation_enabled", false);
-        this->declare_parameter<double>("interpolation_output_fps", 10.0);
-        this->declare_parameter<double>("interpolation_duration_sec", 2.0);
+        this->declare_parameter<int>("interpolation_intermediate_frames", 4);
         this->declare_parameter<double>("interpolation_flow_scale", 0.25);
         this->declare_parameter<std::string>("interpolation_dis_preset", "ultrafast");
         this->declare_parameter<bool>("interpolation_bidirectional_flow", false);
-        this->declare_parameter<bool>("interpolation_lock_camera", true);
+        this->declare_parameter<bool>("interpolation_lock_camera", false);
         this->declare_parameter<bool>("interpolation_show_source_window", false);
         this->declare_parameter<std::string>(
             "interpolation_window_suffix", " - DIS Interpolated");
@@ -111,10 +113,9 @@ public:
         auto camera_ids = this->get_parameter("camera_ids").as_string_array();
         interpolation_enabled_ =
             this->get_parameter("interpolation_enabled").as_bool();
-        interpolation_output_fps_ =
-            this->get_parameter("interpolation_output_fps").as_double();
-        interpolation_duration_sec_ =
-            this->get_parameter("interpolation_duration_sec").as_double();
+        interpolation_intermediate_frames_ =
+            this->get_parameter(
+                "interpolation_intermediate_frames").as_int();
         interpolation_flow_scale_ =
             this->get_parameter("interpolation_flow_scale").as_double();
         interpolation_dis_preset_name_ =
@@ -129,6 +130,11 @@ public:
             this->get_parameter("interpolation_window_suffix").as_string();
 
         if (interpolation_enabled_) {
+            if (interpolation_intermediate_frames_ < 0) {
+                throw std::invalid_argument(
+                    "interpolation_intermediate_frames must be "
+                    "greater than or equal to zero");
+            }
             interpolation_dis_preset_ =
                 parse_dis_preset(interpolation_dis_preset_name_);
         }
@@ -192,8 +198,9 @@ public:
 
             if (interpolation_enabled_) {
                 pointcloud_visualization::DisInterpolationConfig interpolation_config;
-                interpolation_config.output_fps = interpolation_output_fps_;
-                interpolation_config.duration_sec = interpolation_duration_sec_;
+                interpolation_config.intermediate_frame_count =
+                    static_cast<std::size_t>(
+                        interpolation_intermediate_frames_);
                 interpolation_config.flow_scale = interpolation_flow_scale_;
                 interpolation_config.dis_preset = interpolation_dis_preset_;
                 interpolation_config.use_bidirectional_flow =
@@ -219,6 +226,11 @@ public:
             visualizers_.push_back(std::move(cfg));
         }
 
+        if (interpolation_enabled_) {
+            highgui_window_thread_started_ =
+                cv::startWindowThread() > 0;
+        }
+
         // 3. 订阅话题 (运行在 ROS 线程)
         subscription_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
             sub_topic, 10, std::bind(&VisualizationNode::mesh_callback, this, _1)
@@ -226,19 +238,15 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "[*] Visualization started. %zu windows have been brought up.", visualizers_.size());
         if (interpolation_enabled_) {
-            const int interval_count = std::max(
-                1, static_cast<int>(std::lround(
-                       interpolation_output_fps_ *
-                       interpolation_duration_sec_)));
             RCLCPP_INFO(
                 this->get_logger(),
-                "[*] %s DIS interpolation enabled: %.1f FPS, %.2f s per "
-                "pair, %d intermediate frames, scale %.2f, preset %s.",
+                "[*] %s DIS interpolation enabled: %d intermediate "
+                "frames per real-frame pair (approximately %dx source "
+                "frame count), scale %.2f, preset %s.",
                 interpolation_bidirectional_flow_ ?
                     "Bidirectional" : "Single-direction",
-                interpolation_output_fps_,
-                interpolation_duration_sec_,
-                std::max(0, interval_count - 1),
+                interpolation_intermediate_frames_,
+                interpolation_intermediate_frames_ + 1,
                 interpolation_flow_scale_,
                 interpolation_dis_preset_name_.c_str());
             RCLCPP_INFO(
@@ -246,27 +254,67 @@ public:
                 "[*] Source render window is %s; only the interpolated "
                 "window is intended for normal viewing.",
                 interpolation_show_source_window_ ? "visible" : "hidden");
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[*] OpenCV HighGUI event thread is %s.",
+                highgui_window_thread_started_ ?
+                    "enabled" : "not available; using waitKey fallback");
         }
     }
 
     // 维持 UI 心跳的主循环函数
     void update_ui() {
         std::shared_ptr<open3d::geometry::TriangleMesh> mesh_to_render = nullptr;
+        std::chrono::steady_clock::time_point mesh_received_at;
 
         // 从交换区安全地取出新数据
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (new_mesh_available_) {
                 mesh_to_render = latest_mesh_;
+                mesh_received_at = latest_mesh_received_at_;
                 new_mesh_available_ = false;
             }
         }
 
         // 遍历更新所有渲染窗口
         for (auto& item : visualizers_) {
+            if (item.interpolator != nullptr) {
+                ShowReadyInterpolatedFrame(item);
+            }
+
+            const auto source_processing_started_at =
+                std::chrono::steady_clock::now();
+
             if (mesh_to_render != nullptr) {
-                item.vis->ClearGeometries();
-                item.vis->AddGeometry(mesh_to_render, item.is_first_frame);
+                if (interpolation_enabled_) {
+                    // Keep one Open3D geometry and update its buffers. Recreating
+                    // all render resources for every source mesh blocks image
+                    // playback on large meshes.
+                    item.vis->PollEvents();
+                    if (item.interpolation_render_mesh == nullptr) {
+                        item.interpolation_render_mesh =
+                            std::make_shared<
+                                open3d::geometry::TriangleMesh>(
+                                *mesh_to_render);
+                        if (!item.vis->AddGeometry(
+                                item.interpolation_render_mesh, true)) {
+                            throw std::runtime_error(
+                                "failed to add interpolation source mesh");
+                        }
+                    } else {
+                        *item.interpolation_render_mesh = *mesh_to_render;
+                        if (!item.vis->UpdateGeometry(
+                                item.interpolation_render_mesh)) {
+                            throw std::runtime_error(
+                                "failed to update interpolation source mesh");
+                        }
+                    }
+                } else {
+                    item.vis->ClearGeometries();
+                    item.vis->AddGeometry(
+                        mesh_to_render, item.is_first_frame);
+                }
 
                 // 光流要求相邻两张图使用相同视角；启用插帧时可锁定相机。
                 if (item.is_first_frame ||
@@ -285,12 +333,6 @@ public:
                 // is disabled.
                 item.vis->PollEvents();
                 item.vis->UpdateRender();
-            } else if (mesh_to_render != nullptr) {
-                // Rendering the source mesh on every UI tick can starve the
-                // OpenCV playback window. Render exactly once for each new
-                // mesh, then read the completed frame without a second render.
-                item.vis->UpdateRender();
-                item.vis->PollEvents();
             } else if (interpolation_show_source_window_) {
                 // A visible debug source window still needs event handling,
                 // but it must not request a continuous redraw.
@@ -300,13 +342,34 @@ public:
             if (mesh_to_render != nullptr && item.interpolator != nullptr) {
                 try {
                     auto captured_image =
-                        item.vis->CaptureScreenFloatBuffer(false);
+                        item.vis->CaptureScreenFloatBuffer(true);
                     if (captured_image == nullptr) {
                         throw std::runtime_error(
                             "Open3D returned no captured RGB image");
                     }
+                    cv::Mat rendered_frame =
+                        open3d_float_rgb_to_bgr8(*captured_image);
+                    double maximum_pixel_value = 0.0;
+                    cv::minMaxLoc(
+                        rendered_frame.reshape(1),
+                        nullptr,
+                        &maximum_pixel_value);
+                    if (maximum_pixel_value <= 0.0) {
+                        throw std::runtime_error(
+                            "Open3D captured an all-black source frame");
+                    }
                     item.interpolator->SubmitFrame(
-                        open3d_float_rgb_to_bgr8(*captured_image));
+                        rendered_frame,
+                        mesh_received_at);
+                    const double capture_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() -
+                            source_processing_started_at).count();
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "[*] Source mesh update, render, and capture "
+                        "completed in %.1f ms.",
+                        capture_ms);
                 } catch (const std::exception& error) {
                     RCLCPP_ERROR(
                         this->get_logger(),
@@ -316,17 +379,6 @@ public:
             }
 
             if (item.interpolator != nullptr) {
-                cv::Mat interpolated_frame;
-                if (item.interpolator->TryGetDisplayFrame(
-                        interpolated_frame)) {
-                    item.displayed_interpolated_frame =
-                        std::move(interpolated_frame);
-                    cv::imshow(
-                        item.interpolation_window_name,
-                        item.displayed_interpolated_frame);
-                    RecordDisplayedFrame(item);
-                }
-
                 const std::string interpolation_status =
                     item.interpolator->ConsumeStatus();
                 if (!interpolation_status.empty()) {
@@ -345,8 +397,29 @@ public:
             }
         }
 
-        if (interpolation_enabled_) {
+        if (interpolation_enabled_ &&
+            !highgui_window_thread_started_) {
+            const auto event_processing_started_at =
+                std::chrono::steady_clock::now();
             cv::waitKey(1);
+            const auto event_processing_finished_at =
+                std::chrono::steady_clock::now();
+            const double event_processing_ms =
+                std::chrono::duration<double, std::milli>(
+                    event_processing_finished_at -
+                    event_processing_started_at).count();
+            if (event_processing_ms > 100.0 &&
+                event_processing_finished_at -
+                    last_highgui_slow_warning_at_ >
+                    std::chrono::seconds(2)) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "[?] OpenCV waitKey blocked for %.1f ms; "
+                    "the GUI/X11 path is limiting image presentation.",
+                    event_processing_ms);
+                last_highgui_slow_warning_at_ =
+                    event_processing_finished_at;
+            }
         }
     }
 
@@ -361,17 +434,44 @@ public:
     }
 
 private:
-    void RecordDisplayedFrame(CamConfig& item) {
+    void ShowReadyInterpolatedFrame(CamConfig& item) {
+        cv::Mat interpolated_frame;
+        if (!item.interpolator->TryGetDisplayFrame(
+                interpolated_frame)) {
+            return;
+        }
+
+        item.displayed_interpolated_frame =
+            std::move(interpolated_frame);
+        const auto imshow_started_at =
+            std::chrono::steady_clock::now();
+        cv::imshow(
+            item.interpolation_window_name,
+            item.displayed_interpolated_frame);
+        const double imshow_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() -
+                imshow_started_at).count();
+        RecordDisplayedFrame(item, imshow_ms);
+    }
+
+    void RecordDisplayedFrame(
+        CamConfig& item, double imshow_ms) {
         const auto now = std::chrono::steady_clock::now();
         const auto reset_gap = std::chrono::duration<double>(
-            std::max(1.0, 3.0 / interpolation_output_fps_));
+            2.0);
 
         if (item.displayed_frames_in_measurement == 0 ||
             now - item.last_displayed_frame_at > reset_gap) {
             item.display_measurement_started_at = now;
             item.displayed_frames_in_measurement = 1;
+            item.imshow_time_sum_ms = imshow_ms;
+            item.imshow_time_max_ms = imshow_ms;
         } else {
             ++item.displayed_frames_in_measurement;
+            item.imshow_time_sum_ms += imshow_ms;
+            item.imshow_time_max_ms =
+                std::max(item.imshow_time_max_ms, imshow_ms);
         }
         item.last_displayed_frame_at = now;
 
@@ -386,19 +486,28 @@ private:
             static_cast<double>(
                 item.displayed_frames_in_measurement - 1) /
             elapsed_sec;
+        const double average_imshow_ms =
+            item.imshow_time_sum_ms /
+            static_cast<double>(
+                item.displayed_frames_in_measurement);
         RCLCPP_INFO(
             this->get_logger(),
-            "[*] Interpolated display \"%s\": %.1f FPS "
-            "(target %.1f FPS).",
+            "[*] Interpolated display \"%s\": %.1f FPS, "
+            "imshow %.1f ms average / %.1f ms max.",
             item.interpolation_window_name.c_str(),
             measured_fps,
-            interpolation_output_fps_);
+            average_imshow_ms,
+            item.imshow_time_max_ms);
 
         item.display_measurement_started_at = now;
         item.displayed_frames_in_measurement = 1;
+        item.imshow_time_sum_ms = imshow_ms;
+        item.imshow_time_max_ms = imshow_ms;
     }
 
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
+        const auto mesh_received_at =
+            std::chrono::steady_clock::now();
         auto mesh = std::make_shared<open3d::geometry::TriangleMesh>();
 
         // 1. 反序列化：还原顶点
@@ -437,26 +546,30 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             latest_mesh_ = mesh;
+            latest_mesh_received_at_ = mesh_received_at;
             new_mesh_available_ = true;
         }
     }
 
     std::vector<CamConfig> visualizers_;
     bool interpolation_enabled_ = false;
-    double interpolation_output_fps_ = 10.0;
-    double interpolation_duration_sec_ = 2.0;
+    int interpolation_intermediate_frames_ = 4;
     double interpolation_flow_scale_ = 0.25;
     int interpolation_dis_preset_ =
         cv::DISOpticalFlow::PRESET_ULTRAFAST;
     std::string interpolation_dis_preset_name_ = "ultrafast";
     bool interpolation_bidirectional_flow_ = false;
-    bool interpolation_lock_camera_ = true;
+    bool interpolation_lock_camera_ = false;
     bool interpolation_show_source_window_ = false;
     std::string interpolation_window_suffix_ = " - DIS Interpolated";
+    bool highgui_window_thread_started_ = false;
+    std::chrono::steady_clock::time_point
+        last_highgui_slow_warning_at_;
 
     // 线程同步
     std::mutex mutex_;
     std::shared_ptr<open3d::geometry::TriangleMesh> latest_mesh_;
+    std::chrono::steady_clock::time_point latest_mesh_received_at_;
     bool new_mesh_available_;
 
     rclcpp::Subscription<pc_msgs::msg::O3DMesh>::SharedPtr subscription_;

@@ -12,12 +12,6 @@ namespace pointcloud_visualization {
 
 DisFrameInterpolator::DisFrameInterpolator(DisInterpolationConfig config)
     : config_(std::move(config)) {
-    if (config_.output_fps <= 0.0) {
-        throw std::invalid_argument("interpolation output_fps must be greater than zero");
-    }
-    if (config_.duration_sec <= 0.0) {
-        throw std::invalid_argument("interpolation duration_sec must be greater than zero");
-    }
     if (config_.flow_scale <= 0.0 || config_.flow_scale > 1.0) {
         throw std::invalid_argument("interpolation flow_scale must be in (0, 1]");
     }
@@ -25,8 +19,6 @@ DisFrameInterpolator::DisFrameInterpolator(DisInterpolationConfig config)
         throw std::invalid_argument("interpolation queue limits must be greater than zero");
     }
 
-    frame_period_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(1.0 / config_.output_fps));
     worker_ = std::thread(&DisFrameInterpolator::WorkerLoop, this);
 }
 
@@ -41,7 +33,9 @@ DisFrameInterpolator::~DisFrameInterpolator() {
     }
 }
 
-void DisFrameInterpolator::SubmitFrame(const cv::Mat& bgr_frame) {
+void DisFrameInterpolator::SubmitFrame(
+    const cv::Mat& bgr_frame,
+    std::chrono::steady_clock::time_point source_frame_time) {
     if (bgr_frame.empty()) {
         SetError("cannot interpolate an empty rendered frame");
         return;
@@ -56,6 +50,7 @@ void DisFrameInterpolator::SubmitFrame(const cv::Mat& bgr_frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (previous_real_frame_.empty()) {
             previous_real_frame_ = bgr_frame.clone();
+            previous_real_frame_time_ = source_frame_time;
 
             FrameSequence first_frame;
             first_frame.frames.push_back(previous_real_frame_.clone());
@@ -66,6 +61,7 @@ void DisFrameInterpolator::SubmitFrame(const cv::Mat& bgr_frame) {
         if (previous_real_frame_.size() != bgr_frame.size()) {
             ++generation_;
             previous_real_frame_ = bgr_frame.clone();
+            previous_real_frame_time_ = source_frame_time;
             pending_pairs_.clear();
             ready_sequences_.clear();
             active_frames_.clear();
@@ -86,8 +82,10 @@ void DisFrameInterpolator::SubmitFrame(const cv::Mat& bgr_frame) {
             FramePair{
                 previous_real_frame_.clone(),
                 bgr_frame.clone(),
+                source_frame_time - previous_real_frame_time_,
                 generation_});
         previous_real_frame_ = bgr_frame.clone();
+        previous_real_frame_time_ = source_frame_time;
         has_new_pair = true;
     }
 
@@ -106,28 +104,32 @@ bool DisFrameInterpolator::TryGetDisplayFrame(cv::Mat& bgr_frame) {
         }
 
         active_frames_ = std::move(ready_sequences_.front().frames);
+        active_frame_period_ =
+            ready_sequences_.front().frame_period;
+        const bool delay_before_first_frame =
+            ready_sequences_.front().delay_before_first_frame;
         ready_sequences_.pop_front();
         active_frame_index_ = 0;
-        next_frame_deadline_ = now;
+        next_frame_deadline_ =
+            delay_before_first_frame ?
+                now + active_frame_period_ : now;
     }
 
     if (now < next_frame_deadline_) {
         return false;
     }
 
-    while (active_frame_index_ + 1 < active_frames_.size() &&
-           now >= next_frame_deadline_ + frame_period_) {
-        ++active_frame_index_;
-        next_frame_deadline_ += frame_period_;
-    }
-
     bgr_frame = active_frames_[active_frame_index_];
     ++active_frame_index_;
-    next_frame_deadline_ += frame_period_;
 
     if (active_frame_index_ >= active_frames_.size()) {
         active_frames_.clear();
         active_frame_index_ = 0;
+    } else {
+        // Fixed-count mode never drops an interpolated frame. If rendering or
+        // GUI presentation was late, continue from the actual presentation
+        // time so the remaining virtual frames stay evenly spaced.
+        next_frame_deadline_ = now + active_frame_period_;
     }
 
     return true;
@@ -168,6 +170,12 @@ void DisFrameInterpolator::WorkerLoop() {
             const auto start_time = std::chrono::steady_clock::now();
             FrameSequence sequence = BuildSequence(pair);
             const std::size_t generated_frame_count = sequence.frames.size();
+            const double source_interval_ms =
+                std::chrono::duration<double, std::milli>(
+                    pair.source_interval).count();
+            const double playback_step_ms =
+                std::chrono::duration<double, std::milli>(
+                    sequence.frame_period).count();
             const auto elapsed_time = std::chrono::steady_clock::now() - start_time;
             const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(elapsed_time).count();
@@ -177,8 +185,14 @@ void DisFrameInterpolator::WorkerLoop() {
                 std::string(config_.use_bidirectional_flow ?
                                 "Bidirectional DIS generated " :
                                 "Single-direction DIS generated ") +
+                std::to_string(config_.intermediate_frame_count) +
+                " intermediate frames (" +
                 std::to_string(generated_frame_count) +
-                " display frames in " + std::to_string(elapsed_ms) + " ms");
+                " queued frames) in " + std::to_string(elapsed_ms) +
+                " ms; source interval " +
+                std::to_string(source_interval_ms) +
+                " ms, playback step " +
+                std::to_string(playback_step_ms) + " ms");
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second.clone());
@@ -281,15 +295,23 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         }
     }
 
-    const int interval_count = std::max(
-        1, static_cast<int>(std::lround(
-               config_.duration_sec * config_.output_fps)));
+    const std::size_t interval_count =
+        config_.intermediate_frame_count + 1;
 
     FrameSequence sequence;
-    sequence.frames.reserve(static_cast<std::size_t>(interval_count + 1));
-    sequence.frames.push_back(pair.first.clone());
+    sequence.frames.reserve(interval_count);
+    sequence.frame_period =
+        pair.source_interval /
+        static_cast<std::chrono::steady_clock::duration::rep>(
+            interval_count);
+    if (sequence.frame_period <=
+        std::chrono::steady_clock::duration::zero()) {
+        sequence.frame_period =
+            std::chrono::milliseconds(1);
+    }
+    sequence.delay_before_first_frame = true;
 
-    for (int k = 1; k < interval_count; ++k) {
+    for (std::size_t k = 1; k < interval_count; ++k) {
         const float alpha =
             static_cast<float>(k) / static_cast<float>(interval_count);
 

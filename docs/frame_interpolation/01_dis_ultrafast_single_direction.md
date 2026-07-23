@@ -11,9 +11,9 @@
 默认参数：
 
 ```text
-真实帧间隔：2.0 s
-目标帧率：10 FPS
-中间帧数：19
+每对真实帧插入：4 张虚拟帧
+输出帧数倍率：约 5 倍
+播放间隔：实际真实帧间隔 / 5
 光流缩放：1/4
 DIS 预设：ULTRAFAST
 光流方向：I0 -> I1，一次
@@ -31,8 +31,8 @@ DIS 预设：ULTRAFAST
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
-  - 生成 19 张中间帧；
-  - 按 10 FPS 向 UI 提供画面。
+  - 默认生成 4 张中间帧；
+  - 根据真实帧到达间隔均匀播放全部中间帧，不丢弃逾期帧。
 - `src/visualization/config/v_dis_ultrafast_config.yaml`
   - 第一阶段独立参数。
 - `src/visualization/launch/v_dis_ultrafast.launch.py`
@@ -71,7 +71,7 @@ ros2 launch visualization v_dis_ultrafast.launch.py
 
 默认只出现一个窗口：
 
-`Real-time Render - Front View - DIS 10 FPS`：延迟播放的插值画面。
+`Real-time Render - Front View - DIS x5`：延迟播放的插值画面。
 
 Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只在新网格到达时渲染一次。
 需要排查源画面捕获时，可将 `interpolation_show_source_window` 临时改为 `true`。
@@ -86,8 +86,7 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `interpolation_enabled` | `true` | 开启插帧窗口 |
-| `interpolation_output_fps` | `10.0` | 插值窗口播放帧率 |
-| `interpolation_duration_sec` | `2.0` | 一对真实帧的播放时长 |
+| `interpolation_intermediate_frames` | `4` | 每两个真实帧之间插入的虚拟帧数 |
 | `interpolation_flow_scale` | `0.25` | DIS 计算分辨率 |
 | `interpolation_dis_preset` | `ultrafast` | `ultrafast`、`fast` 或 `medium` |
 | `interpolation_bidirectional_flow` | `false` | 保持阶段 1 的单向光流 |
@@ -96,6 +95,10 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 
 若计算仍然太慢，先把 `interpolation_flow_scale` 降为 `0.125`。若速度足够但轮廓
 抖动明显，可先将预设改为 `fast`，再决定是否进入阶段 2。
+
+若将 `interpolation_intermediate_frames` 改为 `N`，长期帧数倍率约为 `N + 1`。
+例如原始帧率为 0.5 FPS、`N = 4` 时，输出约为 2.5 FPS；原始帧率为 1 FPS 时，
+输出约为 5 FPS。光流批量生成耗时不等于播放 FPS。
 
 ## 对照运行
 
@@ -111,7 +114,8 @@ ros2 launch visualization v_vis.launch.py
 
 - 日志是否显示 `Single-direction DIS interpolation enabled`；
 - 第二张真实网格到达后是否开始平滑播放；
-- 日志中的 `Interpolated display` 实际显示帧率是否接近 10 FPS；
+- 日志是否显示生成 4 张中间帧以及自动计算的真实帧间隔、播放步长；
+- 实际显示帧数是否约为原始方式的 5 倍；
 - 轮廓是否出现明显双影、拉伸或反方向移动；
 - 光流计算期间 Open3D 和 ROS 是否仍能响应；
 - CPU 占用是否影响上游重建速度；
@@ -122,6 +126,6 @@ ros2 launch visualization v_vis.launch.py
 - 单向光流的反向部分使用近似，不处理真实遮挡；
 - 生成的是二维画面，不是中间三维网格；
 - 用户修改相机后，下一个真实帧到达时会恢复配置相机；
-- 如果真实网格间隔明显不是 2 秒，应手动调整
-  `interpolation_duration_sec`；
+- 原始 `v_vis.launch.py` 不启用插帧，相机仅在第一帧设置，不受
+  `interpolation_lock_camera` 影响；
 - 中间帧在后台预生成，计算完成前会保持上一张已显示画面。

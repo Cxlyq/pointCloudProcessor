@@ -4,14 +4,13 @@ visualization_node:
     camera_ids: ["cam_front"]
 
     interpolation_enabled: true
-    interpolation_output_fps: 10.0
-    interpolation_duration_sec: 2.0
+    interpolation_intermediate_frames: 4
     interpolation_flow_scale: 0.25
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: true
     interpolation_lock_camera: true
     interpolation_show_source_window: false
-    interpolation_window_suffix: " - Bidirectional DIS 10 FPS"
+    interpolation_window_suffix: " - Bidirectional DIS x5"
 
     cam_front:
       name: "Real-time Render - Front View"

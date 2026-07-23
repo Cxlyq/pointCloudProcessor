@@ -5,8 +5,8 @@ visualization_node:
 
     # 第一阶段：只在可视化阶段进行单向、低分辨率 DIS 插帧。
     interpolation_enabled: true
-    interpolation_output_fps: 10.0
-    interpolation_duration_sec: 2.0
+    # 每两个真实帧之间插入4张虚拟帧，长期帧数约为原始的5倍。
+    interpolation_intermediate_frames: 4
     interpolation_flow_scale: 0.25
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: false
@@ -14,7 +14,7 @@ visualization_node:
     # Open3D is retained as a hidden renderer. Set true only when debugging
     # source-frame capture; normal interpolation mode shows one window.
     interpolation_show_source_window: false
-    interpolation_window_suffix: " - DIS 10 FPS"
+    interpolation_window_suffix: " - DIS x5"
 
     cam_front:
       name: "Real-time Render - Front View"
