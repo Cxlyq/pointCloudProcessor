@@ -1,0 +1,122 @@
+# 阶段 1：单向低分辨率 DIS
+
+状态：已实现，可试用。
+
+## 目标
+
+保持现有流水线不变。`visualization_node` 接收相邻两个 `O3DMesh` 后，使用同一相机
+将它们渲染为 `I0` 和 `I1`，在 1/4 分辨率上计算一次单向 DIS 光流，再复用这份
+光流生成中间画面。
+
+默认参数：
+
+```text
+真实帧间隔：2.0 s
+目标帧率：10 FPS
+中间帧数：19
+光流缩放：1/4
+DIS 预设：ULTRAFAST
+光流方向：I0 -> I1，一次
+```
+
+所有光流和中间画面都在可视化包内部处理，不发布到 ROS。
+
+## 实现文件
+
+- `src/visualization/src/visualization_node.cpp`
+  - 捕获 Open3D RGB 渲染画面；
+  - 锁定配置中的相机；
+  - 将插值画面送到独立 OpenCV 窗口。
+- `src/visualization/src/dis_frame_interpolator.cpp`
+  - 后台线程计算低分辨率 DIS；
+  - 将光流放大并按实际宽高比例修正位移；
+  - 生成 19 张中间帧；
+  - 按 10 FPS 向 UI 提供画面。
+- `src/visualization/config/v_dis_ultrafast_config.yaml`
+  - 第一阶段独立参数。
+- `src/visualization/launch/v_dis_ultrafast.launch.py`
+  - 第一阶段独立入口。
+
+## 环境准备
+
+目标 ROS 2 机器需要 OpenCV 开发包：
+
+```bash
+sudo apt update
+sudo apt install libopencv-dev
+```
+
+Open3D、ROS 2 和本项目原有依赖仍按现有环境准备。
+
+## 构建
+
+在工作空间根目录执行：
+
+```bash
+colcon build --packages-up-to visualization
+source install/setup.bash
+```
+
+如果修改了 YAML，而工作空间没有使用 `--symlink-install`，需要重新构建或重新安装
+可视化包。
+
+## 调用
+
+其他流水线节点仍按原来的方式启动。最后启动第一阶段可视化：
+
+```bash
+ros2 launch visualization v_dis_ultrafast.launch.py
+```
+
+会出现两个窗口：
+
+1. `Real-time Render - Front View`：原始 Open3D 网格，仍按真实网格到达频率更新；
+2. `Real-time Render - Front View - DIS 10 FPS`：延迟播放的插值画面。
+
+首张真实网格到达时只能显示静态画面；第二张网格到达并完成光流计算后，才会开始
+播放第一对插值结果。这是预期行为。
+
+## 参数
+
+编辑 `src/visualization/config/v_dis_ultrafast_config.yaml`：
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `interpolation_enabled` | `true` | 开启插帧窗口 |
+| `interpolation_output_fps` | `10.0` | 插值窗口播放帧率 |
+| `interpolation_duration_sec` | `2.0` | 一对真实帧的播放时长 |
+| `interpolation_flow_scale` | `0.25` | DIS 计算分辨率 |
+| `interpolation_dis_preset` | `ultrafast` | `ultrafast`、`fast` 或 `medium` |
+| `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
+
+若计算仍然太慢，先把 `interpolation_flow_scale` 降为 `0.125`。若速度足够但轮廓
+抖动明显，可先将预设改为 `fast`，再决定是否进入阶段 2。
+
+## 对照运行
+
+关闭当前可视化节点后，可使用原始启动方式进行对照：
+
+```bash
+ros2 launch visualization v_vis.launch.py
+```
+
+原始配置没有启用插帧，因此不会创建 OpenCV 插值窗口。
+
+## 试用检查项
+
+- 日志是否显示 `DIS interpolation enabled`；
+- 第二张真实网格到达后是否开始平滑播放；
+- 插值窗口是否接近 10 FPS；
+- 轮廓是否出现明显双影、拉伸或反方向移动；
+- 光流计算期间 Open3D 和 ROS 是否仍能响应；
+- CPU 占用是否影响上游重建速度；
+- 两张真实网格之间是否存在明显黑边。
+
+## 已知限制
+
+- 单向光流的反向部分使用近似，不处理真实遮挡；
+- 生成的是二维画面，不是中间三维网格；
+- 用户修改相机后，下一个真实帧到达时会恢复配置相机；
+- 如果真实网格间隔明显不是 2 秒，应手动调整
+  `interpolation_duration_sec`；
+- 中间帧在后台预生成，计算完成前会保持上一张已显示画面。
