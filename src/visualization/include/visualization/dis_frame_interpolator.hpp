@@ -19,6 +19,7 @@ struct DisInterpolationConfig {
     double duration_sec = 2.0;
     double flow_scale = 0.25;
     int dis_preset = 0;
+    bool use_bidirectional_flow = false;
     cv::Scalar border_color_bgr = cv::Scalar(0.0, 0.0, 0.0);
     std::size_t max_pending_pairs = 2;
     std::size_t max_ready_sequences = 2;

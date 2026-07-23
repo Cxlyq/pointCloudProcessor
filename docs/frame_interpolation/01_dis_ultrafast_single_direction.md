@@ -26,7 +26,8 @@ DIS 预设：ULTRAFAST
 - `src/visualization/src/visualization_node.cpp`
   - 捕获 Open3D RGB 渲染画面；
   - 锁定配置中的相机；
-  - 将插值画面送到独立 OpenCV 窗口。
+  - 插帧模式下隐藏 Open3D 源渲染窗口，只显示 OpenCV 插值窗口；
+  - 仅在真实网格到达时渲染一次源画面，避免持续重绘阻塞插值播放。
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
@@ -68,10 +69,12 @@ source install/setup.bash
 ros2 launch visualization v_dis_ultrafast.launch.py
 ```
 
-会出现两个窗口：
+默认只出现一个窗口：
 
-1. `Real-time Render - Front View`：原始 Open3D 网格，仍按真实网格到达频率更新；
-2. `Real-time Render - Front View - DIS 10 FPS`：延迟播放的插值画面。
+`Real-time Render - Front View - DIS 10 FPS`：延迟播放的插值画面。
+
+Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只在新网格到达时渲染一次。
+需要排查源画面捕获时，可将 `interpolation_show_source_window` 临时改为 `true`。
 
 首张真实网格到达时只能显示静态画面；第二张网格到达并完成光流计算后，才会开始
 播放第一对插值结果。这是预期行为。
@@ -87,7 +90,9 @@ ros2 launch visualization v_dis_ultrafast.launch.py
 | `interpolation_duration_sec` | `2.0` | 一对真实帧的播放时长 |
 | `interpolation_flow_scale` | `0.25` | DIS 计算分辨率 |
 | `interpolation_dis_preset` | `ultrafast` | `ultrafast`、`fast` 或 `medium` |
+| `interpolation_bidirectional_flow` | `false` | 保持阶段 1 的单向光流 |
 | `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
+| `interpolation_show_source_window` | `false` | 是否显示仅用于调试的 Open3D 源窗口 |
 
 若计算仍然太慢，先把 `interpolation_flow_scale` 降为 `0.125`。若速度足够但轮廓
 抖动明显，可先将预设改为 `fast`，再决定是否进入阶段 2。
@@ -104,9 +109,9 @@ ros2 launch visualization v_vis.launch.py
 
 ## 试用检查项
 
-- 日志是否显示 `DIS interpolation enabled`；
+- 日志是否显示 `Single-direction DIS interpolation enabled`；
 - 第二张真实网格到达后是否开始平滑播放；
-- 插值窗口是否接近 10 FPS；
+- 日志中的 `Interpolated display` 实际显示帧率是否接近 10 FPS；
 - 轮廓是否出现明显双影、拉伸或反方向移动；
 - 光流计算期间 Open3D 和 ROS 是否仍能响应；
 - CPU 占用是否影响上游重建速度；

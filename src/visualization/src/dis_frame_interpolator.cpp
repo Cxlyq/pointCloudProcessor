@@ -174,7 +174,10 @@ void DisFrameInterpolator::WorkerLoop() {
 
             PushReadySequence(std::move(sequence), pair.generation);
             SetStatus(
-                "DIS generated " + std::to_string(generated_frame_count) +
+                std::string(config_.use_bidirectional_flow ?
+                                "Bidirectional DIS generated " :
+                                "Single-direction DIS generated ") +
+                std::to_string(generated_frame_count) +
                 " display frames in " + std::to_string(elapsed_ms) + " ms");
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
@@ -231,16 +234,41 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
     auto dis = cv::DISOpticalFlow::create(config_.dis_preset);
     dis->calc(first_gray, second_gray, flow_small);
 
-    cv::Mat flow_full;
-    cv::resize(flow_small, flow_full, pair.first.size(),
-               0.0, 0.0, cv::INTER_LINEAR);
+    const auto resize_flow_to_full_resolution =
+        [&pair, small_width, small_height](const cv::Mat& small_flow) {
+            cv::Mat full_flow;
+            cv::resize(
+                small_flow,
+                full_flow,
+                pair.first.size(),
+                0.0,
+                0.0,
+                cv::INTER_LINEAR);
 
-    std::vector<cv::Mat> flow_channels;
-    cv::split(flow_full, flow_channels);
-    flow_channels[0] *=
-        static_cast<float>(pair.first.cols) / static_cast<float>(small_width);
-    flow_channels[1] *=
-        static_cast<float>(pair.first.rows) / static_cast<float>(small_height);
+            std::vector<cv::Mat> channels;
+            cv::split(full_flow, channels);
+            channels[0] *=
+                static_cast<float>(pair.first.cols) /
+                static_cast<float>(small_width);
+            channels[1] *=
+                static_cast<float>(pair.first.rows) /
+                static_cast<float>(small_height);
+            return channels;
+        };
+
+    const std::vector<cv::Mat> forward_flow_channels =
+        resize_flow_to_full_resolution(flow_small);
+
+    std::vector<cv::Mat> backward_flow_channels;
+    if (config_.use_bidirectional_flow) {
+        cv::Mat backward_flow_small;
+        auto backward_dis =
+            cv::DISOpticalFlow::create(config_.dis_preset);
+        backward_dis->calc(
+            second_gray, first_gray, backward_flow_small);
+        backward_flow_channels =
+            resize_flow_to_full_resolution(backward_flow_small);
+    }
 
     cv::Mat grid_x(pair.first.rows, pair.first.cols, CV_32FC1);
     cv::Mat grid_y(pair.first.rows, pair.first.cols, CV_32FC1);
@@ -265,12 +293,28 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         const float alpha =
             static_cast<float>(k) / static_cast<float>(interval_count);
 
-        cv::Mat first_map_x = grid_x - alpha * flow_channels[0];
-        cv::Mat first_map_y = grid_y - alpha * flow_channels[1];
-        cv::Mat second_map_x =
-            grid_x + (1.0F - alpha) * flow_channels[0];
-        cv::Mat second_map_y =
-            grid_y + (1.0F - alpha) * flow_channels[1];
+        cv::Mat first_map_x =
+            grid_x - alpha * forward_flow_channels[0];
+        cv::Mat first_map_y =
+            grid_y - alpha * forward_flow_channels[1];
+
+        cv::Mat second_map_x;
+        cv::Mat second_map_y;
+        if (config_.use_bidirectional_flow) {
+            second_map_x =
+                grid_x -
+                (1.0F - alpha) * backward_flow_channels[0];
+            second_map_y =
+                grid_y -
+                (1.0F - alpha) * backward_flow_channels[1];
+        } else {
+            second_map_x =
+                grid_x +
+                (1.0F - alpha) * forward_flow_channels[0];
+            second_map_y =
+                grid_y +
+                (1.0F - alpha) * forward_flow_channels[1];
+        }
 
         cv::Mat warped_first;
         cv::Mat warped_second;

@@ -19,7 +19,7 @@
 | 阶段 | 文档 | 状态 | 修改范围 | 计算开销 | 适用目的 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | [单向低分辨率 DIS](01_dis_ultrafast_single_direction.md) | 已实现 | 仅可视化包 | 低 | 先验证两秒跨度的基础效果 |
-| 2 | [双向 DIS](02_dis_bidirectional.md) | 待实现 | 仅可视化包 | 中 | 降低轮廓重影 |
+| 2 | [双向 DIS](02_dis_bidirectional.md) | 已实现 | 仅可视化包 | 中 | 降低轮廓重影 |
 | 3 | [深度边缘辅助 DIS](03_dis_depth_edge_guided.md) | 待实现 | 仅可视化包 | 中 | 改善白模弱纹理问题 |
 | 4 | [全局仿射插帧](04_global_affine.md) | 待实现 | 仅可视化包 | 最低 | 画面主要是统一运动时使用 |
 | 5 | [全局预对齐加 DIS](05_global_alignment_plus_dis.md) | 待实现 | 仅可视化包 | 中 | 大位移时降低 DIS 搜索难度 |
@@ -48,5 +48,14 @@ ros2 launch visualization v_vis.launch.py
 ```bash
 ros2 launch visualization v_dis_ultrafast.launch.py
 ```
+
+第二阶段双向 DIS 插帧显示：
+
+```bash
+ros2 launch visualization v_dis_bidirectional.launch.py
+```
+
+两个插帧入口默认都只显示插值结果窗口；Open3D 源渲染窗口在后台隐藏，并且只在新
+网格到达时渲染一次，避免占用插值播放线程。
 
 不要同时启动两个可视化 launch；需要比较时，先停止当前可视化节点再切换。

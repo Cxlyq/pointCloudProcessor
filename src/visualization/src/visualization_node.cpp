@@ -85,6 +85,9 @@ struct CamConfig {
     std::string interpolation_window_name;
     std::unique_ptr<pointcloud_visualization::DisFrameInterpolator> interpolator;
     cv::Mat displayed_interpolated_frame;
+    std::chrono::steady_clock::time_point display_measurement_started_at;
+    std::chrono::steady_clock::time_point last_displayed_frame_at;
+    std::size_t displayed_frames_in_measurement = 0;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -98,7 +101,9 @@ public:
         this->declare_parameter<double>("interpolation_duration_sec", 2.0);
         this->declare_parameter<double>("interpolation_flow_scale", 0.25);
         this->declare_parameter<std::string>("interpolation_dis_preset", "ultrafast");
+        this->declare_parameter<bool>("interpolation_bidirectional_flow", false);
         this->declare_parameter<bool>("interpolation_lock_camera", true);
+        this->declare_parameter<bool>("interpolation_show_source_window", false);
         this->declare_parameter<std::string>(
             "interpolation_window_suffix", " - DIS Interpolated");
 
@@ -114,8 +119,12 @@ public:
             this->get_parameter("interpolation_flow_scale").as_double();
         interpolation_dis_preset_name_ =
             this->get_parameter("interpolation_dis_preset").as_string();
+        interpolation_bidirectional_flow_ =
+            this->get_parameter("interpolation_bidirectional_flow").as_bool();
         interpolation_lock_camera_ =
             this->get_parameter("interpolation_lock_camera").as_bool();
+        interpolation_show_source_window_ =
+            this->get_parameter("interpolation_show_source_window").as_bool();
         interpolation_window_suffix_ =
             this->get_parameter("interpolation_window_suffix").as_string();
 
@@ -158,7 +167,18 @@ public:
 
             // 实例化并创建 Open3D 窗口
             cfg.vis = std::make_shared<open3d::visualization::Visualizer>();
-            cfg.vis->CreateVisualizerWindow(cfg.name, cfg.width, cfg.height);
+            const bool source_window_visible =
+                !interpolation_enabled_ || interpolation_show_source_window_;
+            if (!cfg.vis->CreateVisualizerWindow(
+                    cfg.name,
+                    cfg.width,
+                    cfg.height,
+                    50,
+                    50,
+                    source_window_visible)) {
+                throw std::runtime_error(
+                    "failed to create Open3D source renderer for " + cam_id);
+            }
 
             // 配置渲染选项 (对应原 Python 代码的 vis.get_render_option())
             auto& opt = cfg.vis->GetRenderOption();
@@ -176,6 +196,8 @@ public:
                 interpolation_config.duration_sec = interpolation_duration_sec_;
                 interpolation_config.flow_scale = interpolation_flow_scale_;
                 interpolation_config.dis_preset = interpolation_dis_preset_;
+                interpolation_config.use_bidirectional_flow =
+                    interpolation_bidirectional_flow_;
                 interpolation_config.border_color_bgr = cv::Scalar(
                     cfg.bg_color.z() * 255.0,
                     cfg.bg_color.y() * 255.0,
@@ -210,13 +232,20 @@ public:
                        interpolation_duration_sec_)));
             RCLCPP_INFO(
                 this->get_logger(),
-                "[*] DIS interpolation enabled: %.1f FPS, %.2f s per pair, "
-                "%d intermediate frames, scale %.2f, preset %s.",
+                "[*] %s DIS interpolation enabled: %.1f FPS, %.2f s per "
+                "pair, %d intermediate frames, scale %.2f, preset %s.",
+                interpolation_bidirectional_flow_ ?
+                    "Bidirectional" : "Single-direction",
                 interpolation_output_fps_,
                 interpolation_duration_sec_,
                 std::max(0, interval_count - 1),
                 interpolation_flow_scale_,
                 interpolation_dis_preset_name_.c_str());
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[*] Source render window is %s; only the interpolated "
+                "window is intended for normal viewing.",
+                interpolation_show_source_window_ ? "visible" : "hidden");
         }
     }
 
@@ -240,7 +269,8 @@ public:
                 item.vis->AddGeometry(mesh_to_render, item.is_first_frame);
 
                 // 光流要求相邻两张图使用相同视角；启用插帧时可锁定相机。
-                if (item.is_first_frame || interpolation_lock_camera_) {
+                if (item.is_first_frame ||
+                    (interpolation_enabled_ && interpolation_lock_camera_)) {
                     auto& view_ctl = item.vis->GetViewControl();
                     view_ctl.SetFront(item.front);
                     view_ctl.SetLookat(item.lookat);
@@ -250,14 +280,27 @@ public:
                 item.is_first_frame = false;
             }
 
-            // 响应窗口事件，防止 UI 卡死
-            item.vis->PollEvents();
-            item.vis->UpdateRender();
+            if (!interpolation_enabled_) {
+                // Preserve the original visualizer behavior when interpolation
+                // is disabled.
+                item.vis->PollEvents();
+                item.vis->UpdateRender();
+            } else if (mesh_to_render != nullptr) {
+                // Rendering the source mesh on every UI tick can starve the
+                // OpenCV playback window. Render exactly once for each new
+                // mesh, then read the completed frame without a second render.
+                item.vis->UpdateRender();
+                item.vis->PollEvents();
+            } else if (interpolation_show_source_window_) {
+                // A visible debug source window still needs event handling,
+                // but it must not request a continuous redraw.
+                item.vis->PollEvents();
+            }
 
             if (mesh_to_render != nullptr && item.interpolator != nullptr) {
                 try {
                     auto captured_image =
-                        item.vis->CaptureScreenFloatBuffer(true);
+                        item.vis->CaptureScreenFloatBuffer(false);
                     if (captured_image == nullptr) {
                         throw std::runtime_error(
                             "Open3D returned no captured RGB image");
@@ -281,6 +324,7 @@ public:
                     cv::imshow(
                         item.interpolation_window_name,
                         item.displayed_interpolated_frame);
+                    RecordDisplayedFrame(item);
                 }
 
                 const std::string interpolation_status =
@@ -317,6 +361,43 @@ public:
     }
 
 private:
+    void RecordDisplayedFrame(CamConfig& item) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto reset_gap = std::chrono::duration<double>(
+            std::max(1.0, 3.0 / interpolation_output_fps_));
+
+        if (item.displayed_frames_in_measurement == 0 ||
+            now - item.last_displayed_frame_at > reset_gap) {
+            item.display_measurement_started_at = now;
+            item.displayed_frames_in_measurement = 1;
+        } else {
+            ++item.displayed_frames_in_measurement;
+        }
+        item.last_displayed_frame_at = now;
+
+        const double elapsed_sec = std::chrono::duration<double>(
+            now - item.display_measurement_started_at).count();
+        if (elapsed_sec < 2.0 ||
+            item.displayed_frames_in_measurement < 2) {
+            return;
+        }
+
+        const double measured_fps =
+            static_cast<double>(
+                item.displayed_frames_in_measurement - 1) /
+            elapsed_sec;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[*] Interpolated display \"%s\": %.1f FPS "
+            "(target %.1f FPS).",
+            item.interpolation_window_name.c_str(),
+            measured_fps,
+            interpolation_output_fps_);
+
+        item.display_measurement_started_at = now;
+        item.displayed_frames_in_measurement = 1;
+    }
+
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
         auto mesh = std::make_shared<open3d::geometry::TriangleMesh>();
 
@@ -368,7 +449,9 @@ private:
     int interpolation_dis_preset_ =
         cv::DISOpticalFlow::PRESET_ULTRAFAST;
     std::string interpolation_dis_preset_name_ = "ultrafast";
+    bool interpolation_bidirectional_flow_ = false;
     bool interpolation_lock_camera_ = true;
+    bool interpolation_show_source_window_ = false;
     std::string interpolation_window_suffix_ = " - DIS Interpolated";
 
     // 线程同步
