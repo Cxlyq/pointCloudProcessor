@@ -1,6 +1,8 @@
 visualization_node:
   ros__parameters:
     subscribe_topic: "/reconstruction/white_mesh"
+    fps_logging_enabled: true
+    fps_logging_interval_sec: 5.0
     # 原始可视化不启用插帧，也不在新网格到达时强制恢复相机。
     interpolation_enabled: false
     interpolation_lock_camera: false

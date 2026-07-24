@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <stdexcept>
+#include <sstream>
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
@@ -94,7 +96,9 @@ void DisFrameInterpolator::SubmitFrame(
     }
 }
 
-bool DisFrameInterpolator::TryGetDisplayFrame(cv::Mat& bgr_frame) {
+bool DisFrameInterpolator::TryGetDisplayFrame(
+    cv::Mat& bgr_frame,
+    DisDisplayTiming* timing) {
     const auto now = std::chrono::steady_clock::now();
 
     if (active_frames_.empty()) {
@@ -117,6 +121,10 @@ bool DisFrameInterpolator::TryGetDisplayFrame(cv::Mat& bgr_frame) {
 
     if (now < next_frame_deadline_) {
         return false;
+    }
+
+    if (timing != nullptr) {
+        timing->starts_new_sequence = active_frame_index_ == 0;
     }
 
     bgr_frame = active_frames_[active_frame_index_];
@@ -169,30 +177,20 @@ void DisFrameInterpolator::WorkerLoop() {
         try {
             const auto start_time = std::chrono::steady_clock::now();
             FrameSequence sequence = BuildSequence(pair);
-            const std::size_t generated_frame_count = sequence.frames.size();
-            const double source_interval_ms =
-                std::chrono::duration<double, std::milli>(
-                    pair.source_interval).count();
-            const double playback_step_ms =
-                std::chrono::duration<double, std::milli>(
-                    sequence.frame_period).count();
             const auto elapsed_time = std::chrono::steady_clock::now() - start_time;
             const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(elapsed_time).count();
 
             PushReadySequence(std::move(sequence), pair.generation);
-            SetStatus(
-                std::string(config_.use_bidirectional_flow ?
-                                "Bidirectional DIS generated " :
-                                "Single-direction DIS generated ") +
-                std::to_string(config_.intermediate_frame_count) +
-                " intermediate frames (" +
-                std::to_string(generated_frame_count) +
-                " queued frames) in " + std::to_string(elapsed_ms) +
-                " ms; source interval " +
-                std::to_string(source_interval_ms) +
-                " ms, playback step " +
-                std::to_string(playback_step_ms) + " ms");
+            std::ostringstream status;
+            status << (config_.use_bidirectional_flow ?
+                           "Bidirectional DIS" :
+                           "Single-direction DIS")
+                   << ": " << config_.intermediate_frame_count
+                   << " intermediate display frames in "
+                   << std::fixed << std::setprecision(1)
+                   << elapsed_ms << " ms";
+            SetStatus(status.str());
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second.clone());

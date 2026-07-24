@@ -2,6 +2,8 @@ visualization_node:
   ros__parameters:
     subscribe_topic: "/reconstruction/white_mesh"
     camera_ids: ["cam_front"]
+    fps_logging_enabled: true
+    fps_logging_interval_sec: 5.0
 
     # 第一阶段：只在可视化阶段进行单向、低分辨率 DIS 插帧。
     interpolation_enabled: true

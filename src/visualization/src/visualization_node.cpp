@@ -69,6 +69,16 @@ cv::Mat open3d_float_rgb_to_bgr8(open3d::geometry::Image& image) {
 
 }  // namespace
 
+struct FpsWindow {
+    bool initialized = false;
+    std::chrono::steady_clock::time_point window_started_at;
+    std::chrono::steady_clock::time_point last_frame_at;
+    std::size_t interval_count = 0;
+    double maximum_gap_ms = 0.0;
+    std::size_t playback_interval_count = 0;
+    double playback_interval_sum_sec = 0.0;
+};
+
 // 用于存储单一相机窗口的配置与实例状态
 struct CamConfig {
     std::string name;
@@ -86,11 +96,8 @@ struct CamConfig {
     std::string interpolation_window_name;
     std::unique_ptr<pointcloud_visualization::DisFrameInterpolator> interpolator;
     cv::Mat displayed_interpolated_frame;
-    std::chrono::steady_clock::time_point display_measurement_started_at;
-    std::chrono::steady_clock::time_point last_displayed_frame_at;
-    std::size_t displayed_frames_in_measurement = 0;
-    double imshow_time_sum_ms = 0.0;
-    double imshow_time_max_ms = 0.0;
+    FpsWindow source_fps;
+    FpsWindow interpolation_fps;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -99,6 +106,8 @@ public:
         // 1. 声明节点的基础话题和相机列表
         this->declare_parameter<std::string>("subscribe_topic", "/reconstruction/white_mesh");
         this->declare_parameter<std::vector<std::string>>("camera_ids", {"cam_front"});
+        this->declare_parameter<bool>("fps_logging_enabled", true);
+        this->declare_parameter<double>("fps_logging_interval_sec", 5.0);
         this->declare_parameter<bool>("interpolation_enabled", false);
         this->declare_parameter<int>("interpolation_intermediate_frames", 4);
         this->declare_parameter<double>("interpolation_flow_scale", 0.25);
@@ -111,6 +120,10 @@ public:
 
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto camera_ids = this->get_parameter("camera_ids").as_string_array();
+        fps_logging_enabled_ =
+            this->get_parameter("fps_logging_enabled").as_bool();
+        fps_logging_interval_sec_ =
+            this->get_parameter("fps_logging_interval_sec").as_double();
         interpolation_enabled_ =
             this->get_parameter("interpolation_enabled").as_bool();
         interpolation_intermediate_frames_ =
@@ -128,6 +141,11 @@ public:
             this->get_parameter("interpolation_show_source_window").as_bool();
         interpolation_window_suffix_ =
             this->get_parameter("interpolation_window_suffix").as_string();
+
+        if (fps_logging_enabled_ && fps_logging_interval_sec_ <= 0.0) {
+            throw std::invalid_argument(
+                "fps_logging_interval_sec must be greater than zero");
+        }
 
         if (interpolation_enabled_) {
             if (interpolation_intermediate_frames_ < 0) {
@@ -237,6 +255,12 @@ public:
         );
 
         RCLCPP_INFO(this->get_logger(), "[*] Visualization started. %zu windows have been brought up.", visualizers_.size());
+        if (fps_logging_enabled_) {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[FPS] Logging enabled with a %.1f s measurement window.",
+                fps_logging_interval_sec_);
+        }
         if (interpolation_enabled_) {
             RCLCPP_INFO(
                 this->get_logger(),
@@ -249,12 +273,12 @@ public:
                 interpolation_intermediate_frames_ + 1,
                 interpolation_flow_scale_,
                 interpolation_dis_preset_name_.c_str());
-            RCLCPP_INFO(
+            RCLCPP_DEBUG(
                 this->get_logger(),
                 "[*] Source render window is %s; only the interpolated "
                 "window is intended for normal viewing.",
                 interpolation_show_source_window_ ? "visible" : "hidden");
-            RCLCPP_INFO(
+            RCLCPP_DEBUG(
                 this->get_logger(),
                 "[*] OpenCV HighGUI event thread is %s.",
                 highgui_window_thread_started_ ?
@@ -333,6 +357,10 @@ public:
                 // is disabled.
                 item.vis->PollEvents();
                 item.vis->UpdateRender();
+                if (mesh_to_render != nullptr) {
+                    RecordSourceFrame(
+                        item, std::chrono::steady_clock::now());
+                }
             } else if (interpolation_show_source_window_) {
                 // A visible debug source window still needs event handling,
                 // but it must not request a continuous redraw.
@@ -361,11 +389,13 @@ public:
                     item.interpolator->SubmitFrame(
                         rendered_frame,
                         mesh_received_at);
+                    RecordSourceFrame(
+                        item, std::chrono::steady_clock::now());
                     const double capture_ms =
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() -
                             source_processing_started_at).count();
-                    RCLCPP_INFO(
+                    RCLCPP_DEBUG(
                         this->get_logger(),
                         "[*] Source mesh update, render, and capture "
                         "completed in %.1f ms.",
@@ -383,7 +413,7 @@ public:
                     item.interpolator->ConsumeStatus();
                 if (!interpolation_status.empty()) {
                     RCLCPP_INFO(
-                        this->get_logger(), "[*] %s",
+                        this->get_logger(), "[GEN] %s",
                         interpolation_status.c_str());
                 }
 
@@ -436,73 +466,126 @@ public:
 private:
     void ShowReadyInterpolatedFrame(CamConfig& item) {
         cv::Mat interpolated_frame;
+        pointcloud_visualization::DisDisplayTiming timing;
         if (!item.interpolator->TryGetDisplayFrame(
-                interpolated_frame)) {
+                interpolated_frame, &timing)) {
             return;
         }
 
         item.displayed_interpolated_frame =
             std::move(interpolated_frame);
-        const auto imshow_started_at =
-            std::chrono::steady_clock::now();
         cv::imshow(
             item.interpolation_window_name,
             item.displayed_interpolated_frame);
-        const double imshow_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() -
-                imshow_started_at).count();
-        RecordDisplayedFrame(item, imshow_ms);
+        RecordInterpolatedFrame(
+            item,
+            std::chrono::steady_clock::now(),
+            timing.starts_new_sequence);
     }
 
-    void RecordDisplayedFrame(
-        CamConfig& item, double imshow_ms) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto reset_gap = std::chrono::duration<double>(
-            2.0);
+    void InitializeFpsWindow(
+        FpsWindow& window,
+        std::chrono::steady_clock::time_point now) {
+        window.initialized = true;
+        window.window_started_at = now;
+        window.last_frame_at = now;
+        window.interval_count = 0;
+        window.maximum_gap_ms = 0.0;
+        window.playback_interval_count = 0;
+        window.playback_interval_sum_sec = 0.0;
+    }
 
-        if (item.displayed_frames_in_measurement == 0 ||
-            now - item.last_displayed_frame_at > reset_gap) {
-            item.display_measurement_started_at = now;
-            item.displayed_frames_in_measurement = 1;
-            item.imshow_time_sum_ms = imshow_ms;
-            item.imshow_time_max_ms = imshow_ms;
-        } else {
-            ++item.displayed_frames_in_measurement;
-            item.imshow_time_sum_ms += imshow_ms;
-            item.imshow_time_max_ms =
-                std::max(item.imshow_time_max_ms, imshow_ms);
+    void RecordSourceFrame(
+        CamConfig& item,
+        std::chrono::steady_clock::time_point now) {
+        if (!fps_logging_enabled_) {
+            return;
         }
-        item.last_displayed_frame_at = now;
+
+        FpsWindow& window = item.source_fps;
+        if (!window.initialized) {
+            InitializeFpsWindow(window, now);
+            return;
+        }
+
+        const double gap_sec = std::chrono::duration<double>(
+            now - window.last_frame_at).count();
+        window.last_frame_at = now;
+        ++window.interval_count;
+        window.maximum_gap_ms =
+            std::max(window.maximum_gap_ms, gap_sec * 1000.0);
 
         const double elapsed_sec = std::chrono::duration<double>(
-            now - item.display_measurement_started_at).count();
-        if (elapsed_sec < 2.0 ||
-            item.displayed_frames_in_measurement < 2) {
+            now - window.window_started_at).count();
+        if (elapsed_sec < fps_logging_interval_sec_) {
             return;
         }
 
         const double measured_fps =
-            static_cast<double>(
-                item.displayed_frames_in_measurement - 1) /
-            elapsed_sec;
-        const double average_imshow_ms =
-            item.imshow_time_sum_ms /
-            static_cast<double>(
-                item.displayed_frames_in_measurement);
+            static_cast<double>(window.interval_count) / elapsed_sec;
         RCLCPP_INFO(
             this->get_logger(),
-            "[*] Interpolated display \"%s\": %.1f FPS, "
-            "imshow %.1f ms average / %.1f ms max.",
-            item.interpolation_window_name.c_str(),
+            "[FPS] Source \"%s\": %.2f FPS | %.1f s window | "
+            "max gap %.0f ms.",
+            item.name.c_str(),
             measured_fps,
-            average_imshow_ms,
-            item.imshow_time_max_ms);
+            elapsed_sec,
+            window.maximum_gap_ms);
 
-        item.display_measurement_started_at = now;
-        item.displayed_frames_in_measurement = 1;
-        item.imshow_time_sum_ms = imshow_ms;
-        item.imshow_time_max_ms = imshow_ms;
+        InitializeFpsWindow(window, now);
+    }
+
+    void RecordInterpolatedFrame(
+        CamConfig& item,
+        std::chrono::steady_clock::time_point now,
+        bool starts_new_sequence) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+
+        FpsWindow& window = item.interpolation_fps;
+        if (!window.initialized) {
+            InitializeFpsWindow(window, now);
+            return;
+        }
+
+        const double gap_sec = std::chrono::duration<double>(
+            now - window.last_frame_at).count();
+        window.last_frame_at = now;
+        ++window.interval_count;
+        window.maximum_gap_ms =
+            std::max(window.maximum_gap_ms, gap_sec * 1000.0);
+        if (!starts_new_sequence) {
+            ++window.playback_interval_count;
+            window.playback_interval_sum_sec += gap_sec;
+        }
+
+        const double elapsed_sec = std::chrono::duration<double>(
+            now - window.window_started_at).count();
+        if (elapsed_sec < fps_logging_interval_sec_) {
+            return;
+        }
+
+        const double effective_fps =
+            static_cast<double>(window.interval_count) / elapsed_sec;
+        const double playback_fps =
+            window.playback_interval_count > 0 &&
+                    window.playback_interval_sum_sec > 0.0 ?
+                static_cast<double>(
+                    window.playback_interval_count) /
+                    window.playback_interval_sum_sec :
+                effective_fps;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[FPS] Interpolated \"%s\": playback %.1f FPS | "
+            "effective %.1f FPS | %.1f s window | max gap %.0f ms.",
+            item.interpolation_window_name.c_str(),
+            playback_fps,
+            effective_fps,
+            elapsed_sec,
+            window.maximum_gap_ms);
+
+        InitializeFpsWindow(window, now);
     }
 
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
@@ -552,6 +635,8 @@ private:
     }
 
     std::vector<CamConfig> visualizers_;
+    bool fps_logging_enabled_ = true;
+    double fps_logging_interval_sec_ = 5.0;
     bool interpolation_enabled_ = false;
     int interpolation_intermediate_frames_ = 4;
     double interpolation_flow_scale_ = 0.25;

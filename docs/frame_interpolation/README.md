@@ -76,3 +76,38 @@ ros2 launch visualization v_dis_quality_x20.launch.py
 | `v_dis_quality_x20.launch.py` | 19 | 1/2 | 单向 | 本轮帧数与清晰度测试 |
 
 不要同时启动多个可视化 launch；需要比较时，先停止当前可视化节点再切换。
+
+## FPS 统计与日志
+
+所有版本默认开启 FPS 日志，统计窗口为 5 秒：
+
+```yaml
+fps_logging_enabled: true
+fps_logging_interval_sec: 5.0
+```
+
+原始可视化输出：
+
+```text
+[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
+```
+
+这里统计的是完成新网格渲染的频率，不把没有新内容的 UI 空转计为新帧。
+
+插帧版本同时输出：
+
+```text
+[GEN] Single-direction DIS: 19 intermediate display frames in 320.5 ms
+[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
+[FPS] Interpolated "...": playback 9.8 FPS | effective 8.7 FPS | 5.1 s window | max gap 410 ms.
+```
+
+- `playback FPS`：同一批中间帧连续播放时，根据实际提交间隔计算，更接近运动时的体感；
+- `effective FPS`：把批次间等待、计算和排队的停顿也计入，通常更低；
+- `max gap`：统计窗口内相邻输出帧的最大间隔，用于识别平均 FPS 掩盖的卡顿；
+- `[GEN]`：每对真实帧生成的中间显示帧数量和总耗时。
+
+OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此插值 FPS 的测量点是
+`imshow()` 完成提交的时刻。相比旧统计，新统计不再因两秒空档重置，并把批内播放速度
+与包含停顿的长期有效速度分开报告。源网格渲染耗时和 HighGUI 后端信息已降为 DEBUG，
+默认 INFO 日志主要保留 `[GEN]`、`[FPS]`、警告和错误。

@@ -2,6 +2,8 @@ visualization_node:
   ros__parameters:
     subscribe_topic: "/reconstruction/white_mesh"
     camera_ids: ["cam_front"]
+    fps_logging_enabled: true
+    fps_logging_interval_sec: 5.0
 
     # Quality comparison profile: keep single-direction ULTRAFAST DIS, but
     # calculate flow at half resolution and insert 19 virtual frames.

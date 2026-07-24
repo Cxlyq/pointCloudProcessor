@@ -59,7 +59,8 @@ ros2 launch visualization v_dis_ultrafast.launch.py
 ## 试用时记录
 
 - 日志中一对真实帧生成 19 张中间帧的耗时；
-- `playback step` 是否约为真实帧间隔的 1/20；
+- `[FPS]` 中批内 `playback` 是否接近预期；
+- 长期 `effective` 与 `playback` 的差距是否来自较大的 `max gap`；
 - 插值轮廓是否比基础版清晰；
 - 插值画面是否仍有双边或拖影；
 - 实际显示是否接近原始帧数的 20 倍；

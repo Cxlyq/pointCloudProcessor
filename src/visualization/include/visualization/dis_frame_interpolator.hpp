@@ -24,6 +24,10 @@ struct DisInterpolationConfig {
     std::size_t max_ready_sequences = 2;
 };
 
+struct DisDisplayTiming {
+    bool starts_new_sequence = false;
+};
+
 class DisFrameInterpolator {
 public:
     explicit DisFrameInterpolator(DisInterpolationConfig config);
@@ -35,7 +39,9 @@ public:
     void SubmitFrame(
         const cv::Mat& bgr_frame,
         std::chrono::steady_clock::time_point source_frame_time);
-    bool TryGetDisplayFrame(cv::Mat& bgr_frame);
+    bool TryGetDisplayFrame(
+        cv::Mat& bgr_frame,
+        DisDisplayTiming* timing = nullptr);
     std::string ConsumeStatus();
     std::string ConsumeError();
 
