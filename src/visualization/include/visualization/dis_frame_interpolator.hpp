@@ -61,7 +61,7 @@ private:
 
     void WorkerLoop();
     FrameSequence BuildSequence(const FramePair& pair) const;
-    void PushReadySequence(
+    bool PushReadySequence(
         FrameSequence sequence, std::uint64_t generation);
     void SetStatus(std::string status);
     void SetError(std::string error);

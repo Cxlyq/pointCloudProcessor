@@ -73,19 +73,28 @@ void DisFrameInterpolator::SubmitFrame(
             reset_frame.frames.push_back(previous_real_frame_.clone());
             ready_sequences_.push_back(std::move(reset_frame));
             last_error_ = "rendered frame size changed; interpolation state was reset";
+            condition_.notify_all();
             return;
         }
 
+        const auto source_delta =
+            source_frame_time - previous_real_frame_time_;
         if (pending_pairs_.size() >= config_.max_pending_pairs) {
-            pending_pairs_.pop_front();
+            // Preserve the sequence boundary instead of dropping an interior
+            // pair. For example, replace C->D with C->E so that a preceding
+            // B->C sequence still connects to the newest accepted frame.
+            FramePair& newest_pending_pair = pending_pairs_.back();
+            newest_pending_pair.second = bgr_frame.clone();
+            newest_pending_pair.source_interval += source_delta;
+        } else {
+            pending_pairs_.push_back(
+                FramePair{
+                    previous_real_frame_.clone(),
+                    bgr_frame.clone(),
+                    source_delta,
+                    generation_});
         }
 
-        pending_pairs_.push_back(
-            FramePair{
-                previous_real_frame_.clone(),
-                bgr_frame.clone(),
-                source_frame_time - previous_real_frame_time_,
-                generation_});
         previous_real_frame_ = bgr_frame.clone();
         previous_real_frame_time_ = source_frame_time;
         has_new_pair = true;
@@ -102,21 +111,26 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
     const auto now = std::chrono::steady_clock::now();
 
     if (active_frames_.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (ready_sequences_.empty()) {
-            return false;
-        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (ready_sequences_.empty()) {
+                return false;
+            }
 
-        active_frames_ = std::move(ready_sequences_.front().frames);
-        active_frame_period_ =
-            ready_sequences_.front().frame_period;
-        const bool delay_before_first_frame =
-            ready_sequences_.front().delay_before_first_frame;
-        ready_sequences_.pop_front();
-        active_frame_index_ = 0;
-        next_frame_deadline_ =
-            delay_before_first_frame ?
-                now + active_frame_period_ : now;
+            active_frames_ =
+                std::move(ready_sequences_.front().frames);
+            active_frame_period_ =
+                ready_sequences_.front().frame_period;
+            const bool delay_before_first_frame =
+                ready_sequences_.front().delay_before_first_frame;
+            ready_sequences_.pop_front();
+            active_frame_index_ = 0;
+            next_frame_deadline_ =
+                delay_before_first_frame ?
+                    now + active_frame_period_ : now;
+        }
+        // A blocked producer may now publish the next contiguous sequence.
+        condition_.notify_all();
     }
 
     if (now < next_frame_deadline_) {
@@ -181,7 +195,10 @@ void DisFrameInterpolator::WorkerLoop() {
             const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(elapsed_time).count();
 
-            PushReadySequence(std::move(sequence), pair.generation);
+            if (!PushReadySequence(
+                    std::move(sequence), pair.generation)) {
+                continue;
+            }
             std::ostringstream status;
             status << (config_.use_bidirectional_flow ?
                            "Bidirectional DIS" :
@@ -194,13 +211,21 @@ void DisFrameInterpolator::WorkerLoop() {
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second.clone());
-            PushReadySequence(std::move(fallback), pair.generation);
-            SetError(std::string("OpenCV DIS interpolation failed: ") + error.what());
+            if (PushReadySequence(
+                    std::move(fallback), pair.generation)) {
+                SetError(
+                    std::string("OpenCV DIS interpolation failed: ") +
+                    error.what());
+            }
         } catch (const std::exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second.clone());
-            PushReadySequence(std::move(fallback), pair.generation);
-            SetError(std::string("frame interpolation failed: ") + error.what());
+            if (PushReadySequence(
+                    std::move(fallback), pair.generation)) {
+                SetError(
+                    std::string("frame interpolation failed: ") +
+                    error.what());
+            }
         }
     }
 }
@@ -355,16 +380,22 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
     return sequence;
 }
 
-void DisFrameInterpolator::PushReadySequence(
+bool DisFrameInterpolator::PushReadySequence(
     FrameSequence sequence, std::uint64_t generation) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (generation != generation_) {
-        return;
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [this, generation]() {
+        return stopping_ ||
+               generation != generation_ ||
+               ready_sequences_.size() <
+                   config_.max_ready_sequences;
+    });
+
+    if (stopping_ || generation != generation_) {
+        return false;
     }
-    if (ready_sequences_.size() >= config_.max_ready_sequences) {
-        ready_sequences_.pop_front();
-    }
+
     ready_sequences_.push_back(std::move(sequence));
+    return true;
 }
 
 void DisFrameInterpolator::SetStatus(std::string status) {
