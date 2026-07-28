@@ -37,7 +37,8 @@ DisFrameInterpolator::~DisFrameInterpolator() {
 
 void DisFrameInterpolator::SubmitFrame(
     const cv::Mat& bgr_frame,
-    std::chrono::steady_clock::time_point source_frame_time) {
+    std::chrono::steady_clock::time_point frame_arrival_time,
+    std::optional<std::chrono::nanoseconds> source_timestamp) {
     if (bgr_frame.empty()) {
         SetError("cannot interpolate an empty rendered frame");
         return;
@@ -52,7 +53,8 @@ void DisFrameInterpolator::SubmitFrame(
         std::lock_guard<std::mutex> lock(mutex_);
         if (previous_real_frame_.empty()) {
             previous_real_frame_ = bgr_frame.clone();
-            previous_real_frame_time_ = source_frame_time;
+            previous_frame_arrival_time_ = frame_arrival_time;
+            previous_source_timestamp_ = source_timestamp;
 
             FrameSequence first_frame;
             first_frame.frames.push_back(previous_real_frame_.clone());
@@ -63,7 +65,9 @@ void DisFrameInterpolator::SubmitFrame(
         if (previous_real_frame_.size() != bgr_frame.size()) {
             ++generation_;
             previous_real_frame_ = bgr_frame.clone();
-            previous_real_frame_time_ = source_frame_time;
+            previous_frame_arrival_time_ = frame_arrival_time;
+            previous_source_timestamp_ = source_timestamp;
+            source_timestamp_fallback_active_ = false;
             pending_pairs_.clear();
             ready_sequences_.clear();
             active_frames_.clear();
@@ -77,8 +81,27 @@ void DisFrameInterpolator::SubmitFrame(
             return;
         }
 
-        const auto source_delta =
-            source_frame_time - previous_real_frame_time_;
+        auto source_delta =
+            frame_arrival_time - previous_frame_arrival_time_;
+        if (config_.use_source_timestamps) {
+            const bool source_timestamps_are_usable =
+                source_timestamp.has_value() &&
+                previous_source_timestamp_.has_value() &&
+                *source_timestamp > *previous_source_timestamp_;
+            if (source_timestamps_are_usable) {
+                source_delta =
+                    std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                        *source_timestamp -
+                        *previous_source_timestamp_);
+                source_timestamp_fallback_active_ = false;
+            } else if (!source_timestamp_fallback_active_) {
+                last_error_ =
+                    "message timestamps are missing or non-monotonic; "
+                    "interpolation timing fell back to frame arrival times";
+                source_timestamp_fallback_active_ = true;
+            }
+        }
         if (pending_pairs_.size() >= config_.max_pending_pairs) {
             // Preserve the sequence boundary instead of dropping an interior
             // pair. For example, replace C->D with C->E so that a preceding
@@ -96,7 +119,8 @@ void DisFrameInterpolator::SubmitFrame(
         }
 
         previous_real_frame_ = bgr_frame.clone();
-        previous_real_frame_time_ = source_frame_time;
+        previous_frame_arrival_time_ = frame_arrival_time;
+        previous_source_timestamp_ = source_timestamp;
         has_new_pair = true;
     }
 
@@ -125,9 +149,18 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
                 ready_sequences_.front().delay_before_first_frame;
             ready_sequences_.pop_front();
             active_frame_index_ = 0;
-            next_frame_deadline_ =
-                delay_before_first_frame ?
-                    now + active_frame_period_ : now;
+            if (delay_before_first_frame) {
+                if (playback_timeline_initialized_) {
+                    next_frame_deadline_ += active_frame_period_;
+                } else {
+                    next_frame_deadline_ =
+                        now + active_frame_period_;
+                    playback_timeline_initialized_ = true;
+                }
+            } else {
+                next_frame_deadline_ = now;
+                playback_timeline_initialized_ = false;
+            }
         }
         // A blocked producer may now publish the next contiguous sequence.
         condition_.notify_all();
@@ -148,10 +181,10 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
         active_frames_.clear();
         active_frame_index_ = 0;
     } else {
-        // Fixed-count mode never drops an interpolated frame. If rendering or
-        // GUI presentation was late, continue from the actual presentation
-        // time so the remaining virtual frames stay evenly spaced.
-        next_frame_deadline_ = now + active_frame_period_;
+        // Keep one continuous playback timeline. If presentation was late,
+        // later calls catch up instead of permanently stretching the rest of
+        // this sequence and forcing newer sequences to wait.
+        next_frame_deadline_ += active_frame_period_;
     }
 
     return true;

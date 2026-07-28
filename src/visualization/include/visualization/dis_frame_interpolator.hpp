@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +20,7 @@ struct DisInterpolationConfig {
     double flow_scale = 0.25;
     int dis_preset = 0;
     bool use_bidirectional_flow = false;
+    bool use_source_timestamps = false;
     cv::Scalar border_color_bgr = cv::Scalar(0.0, 0.0, 0.0);
     std::size_t max_pending_pairs = 2;
     std::size_t max_ready_sequences = 2;
@@ -38,7 +40,9 @@ public:
 
     void SubmitFrame(
         const cv::Mat& bgr_frame,
-        std::chrono::steady_clock::time_point source_frame_time);
+        std::chrono::steady_clock::time_point frame_arrival_time,
+        std::optional<std::chrono::nanoseconds> source_timestamp =
+            std::nullopt);
     bool TryGetDisplayFrame(
         cv::Mat& bgr_frame,
         DisDisplayTiming* timing = nullptr);
@@ -73,7 +77,10 @@ private:
     bool stopping_ = false;
     std::uint64_t generation_ = 0;
     cv::Mat previous_real_frame_;
-    std::chrono::steady_clock::time_point previous_real_frame_time_;
+    std::chrono::steady_clock::time_point previous_frame_arrival_time_;
+    std::optional<std::chrono::nanoseconds>
+        previous_source_timestamp_;
+    bool source_timestamp_fallback_active_ = false;
     std::deque<FramePair> pending_pairs_;
     std::deque<FrameSequence> ready_sequences_;
     std::string last_status_;
@@ -85,6 +92,7 @@ private:
     std::size_t active_frame_index_ = 0;
     std::chrono::steady_clock::duration active_frame_period_{};
     std::chrono::steady_clock::time_point next_frame_deadline_;
+    bool playback_timeline_initialized_ = false;
 };
 
 }  // namespace pointcloud_visualization

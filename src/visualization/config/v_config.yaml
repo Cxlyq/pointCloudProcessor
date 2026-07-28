@@ -5,6 +5,7 @@ visualization_node:
     fps_logging_interval_sec: 5.0
     # 原始可视化不启用插帧，也不在新网格到达时强制恢复相机。
     interpolation_enabled: false
+    interpolation_timing_source: "arrival"
     interpolation_lock_camera: false
     # 定义需要开启的窗口 ID 列表
     camera_ids: ["cam_front"]

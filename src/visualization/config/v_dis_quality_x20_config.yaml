@@ -12,6 +12,7 @@ visualization_node:
     interpolation_flow_scale: 0.5
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: false
+    interpolation_timing_source: "arrival"
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - DIS Quality x20"

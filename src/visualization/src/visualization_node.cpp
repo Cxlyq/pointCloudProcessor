@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <mutex>
@@ -113,6 +114,8 @@ public:
         this->declare_parameter<double>("interpolation_flow_scale", 0.25);
         this->declare_parameter<std::string>("interpolation_dis_preset", "ultrafast");
         this->declare_parameter<bool>("interpolation_bidirectional_flow", false);
+        this->declare_parameter<std::string>(
+            "interpolation_timing_source", "arrival");
         this->declare_parameter<bool>("interpolation_lock_camera", false);
         this->declare_parameter<bool>("interpolation_show_source_window", false);
         this->declare_parameter<std::string>(
@@ -135,6 +138,9 @@ public:
             this->get_parameter("interpolation_dis_preset").as_string();
         interpolation_bidirectional_flow_ =
             this->get_parameter("interpolation_bidirectional_flow").as_bool();
+        interpolation_timing_source_ =
+            this->get_parameter(
+                "interpolation_timing_source").as_string();
         interpolation_lock_camera_ =
             this->get_parameter("interpolation_lock_camera").as_bool();
         interpolation_show_source_window_ =
@@ -155,6 +161,24 @@ public:
             }
             interpolation_dis_preset_ =
                 parse_dis_preset(interpolation_dis_preset_name_);
+            std::transform(
+                interpolation_timing_source_.begin(),
+                interpolation_timing_source_.end(),
+                interpolation_timing_source_.begin(),
+                [](unsigned char character) {
+                    return static_cast<char>(
+                        std::tolower(character));
+                });
+            if (interpolation_timing_source_ == "arrival") {
+                interpolation_use_message_timestamps_ = false;
+            } else if (
+                interpolation_timing_source_ == "message_stamp") {
+                interpolation_use_message_timestamps_ = true;
+            } else {
+                throw std::invalid_argument(
+                    "interpolation_timing_source must be arrival "
+                    "or message_stamp");
+            }
         }
 
         // 2. 遍历参数，动态加载所有视角的窗口配置
@@ -223,6 +247,8 @@ public:
                 interpolation_config.dis_preset = interpolation_dis_preset_;
                 interpolation_config.use_bidirectional_flow =
                     interpolation_bidirectional_flow_;
+                interpolation_config.use_source_timestamps =
+                    interpolation_use_message_timestamps_;
                 interpolation_config.border_color_bgr = cv::Scalar(
                     cfg.bg_color.z() * 255.0,
                     cfg.bg_color.y() * 255.0,
@@ -273,6 +299,10 @@ public:
                 interpolation_intermediate_frames_ + 1,
                 interpolation_flow_scale_,
                 interpolation_dis_preset_name_.c_str());
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[*] Interpolation timing source: %s.",
+                interpolation_timing_source_.c_str());
             RCLCPP_DEBUG(
                 this->get_logger(),
                 "[*] Source render window is %s; only the interpolated "
@@ -290,6 +320,8 @@ public:
     void update_ui() {
         std::shared_ptr<open3d::geometry::TriangleMesh> mesh_to_render = nullptr;
         std::chrono::steady_clock::time_point mesh_received_at;
+        std::optional<std::chrono::nanoseconds>
+            mesh_source_timestamp;
 
         // 从交换区安全地取出新数据
         {
@@ -297,16 +329,26 @@ public:
             if (new_mesh_available_) {
                 mesh_to_render = latest_mesh_;
                 mesh_received_at = latest_mesh_received_at_;
+                mesh_source_timestamp =
+                    latest_mesh_source_timestamp_;
                 new_mesh_available_ = false;
             }
         }
 
         // 遍历更新所有渲染窗口
-        for (auto& item : visualizers_) {
-            if (item.interpolator != nullptr) {
-                ShowReadyInterpolatedFrame(item);
+        // Present every due interpolation frame before any Open3D source
+        // rendering. A slow source capture must not delay another camera's
+        // already-ready HighGUI frame.
+        if (interpolation_enabled_) {
+            for (auto& item : visualizers_) {
+                if (item.interpolator != nullptr) {
+                    ShowReadyInterpolatedFrame(item);
+                }
             }
+            ProcessHighGuiEvents();
+        }
 
+        for (auto& item : visualizers_) {
             const auto source_processing_started_at =
                 std::chrono::steady_clock::now();
 
@@ -388,7 +430,8 @@ public:
                     }
                     item.interpolator->SubmitFrame(
                         rendered_frame,
-                        mesh_received_at);
+                        mesh_received_at,
+                        mesh_source_timestamp);
                     RecordSourceFrame(
                         item, std::chrono::steady_clock::now());
                     const double capture_ms =
@@ -427,29 +470,15 @@ public:
             }
         }
 
-        if (interpolation_enabled_ &&
-            !highgui_window_thread_started_) {
-            const auto event_processing_started_at =
-                std::chrono::steady_clock::now();
-            cv::waitKey(1);
-            const auto event_processing_finished_at =
-                std::chrono::steady_clock::now();
-            const double event_processing_ms =
-                std::chrono::duration<double, std::milli>(
-                    event_processing_finished_at -
-                    event_processing_started_at).count();
-            if (event_processing_ms > 100.0 &&
-                event_processing_finished_at -
-                    last_highgui_slow_warning_at_ >
-                    std::chrono::seconds(2)) {
-                RCLCPP_WARN(
-                    this->get_logger(),
-                    "[?] OpenCV waitKey blocked for %.1f ms; "
-                    "the GUI/X11 path is limiting image presentation.",
-                    event_processing_ms);
-                last_highgui_slow_warning_at_ =
-                    event_processing_finished_at;
+        // Source rendering may have taken longer than one display period.
+        // Give the continuous timeline one immediate catch-up opportunity.
+        if (interpolation_enabled_) {
+            for (auto& item : visualizers_) {
+                if (item.interpolator != nullptr) {
+                    ShowReadyInterpolatedFrame(item);
+                }
             }
+            ProcessHighGuiEvents();
         }
     }
 
@@ -464,6 +493,34 @@ public:
     }
 
 private:
+    void ProcessHighGuiEvents() {
+        if (highgui_window_thread_started_) {
+            return;
+        }
+
+        const auto event_processing_started_at =
+            std::chrono::steady_clock::now();
+        cv::waitKey(1);
+        const auto event_processing_finished_at =
+            std::chrono::steady_clock::now();
+        const double event_processing_ms =
+            std::chrono::duration<double, std::milli>(
+                event_processing_finished_at -
+                event_processing_started_at).count();
+        if (event_processing_ms > 100.0 &&
+            event_processing_finished_at -
+                last_highgui_slow_warning_at_ >
+                std::chrono::seconds(2)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] OpenCV waitKey blocked for %.1f ms; "
+                "the GUI/X11 path is limiting image presentation.",
+                event_processing_ms);
+            last_highgui_slow_warning_at_ =
+                event_processing_finished_at;
+        }
+    }
+
     void ShowReadyInterpolatedFrame(CamConfig& item) {
         cv::Mat interpolated_frame;
         pointcloud_visualization::DisDisplayTiming timing;
@@ -591,6 +648,17 @@ private:
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
         const auto mesh_received_at =
             std::chrono::steady_clock::now();
+        std::optional<std::chrono::nanoseconds>
+            mesh_source_timestamp;
+        if (msg->header.stamp.sec != 0 ||
+            msg->header.stamp.nanosec != 0U) {
+            mesh_source_timestamp =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::seconds(
+                        msg->header.stamp.sec) +
+                    std::chrono::nanoseconds(
+                        msg->header.stamp.nanosec));
+        }
         auto mesh = std::make_shared<open3d::geometry::TriangleMesh>();
 
         // 1. 反序列化：还原顶点
@@ -630,6 +698,8 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             latest_mesh_ = mesh;
             latest_mesh_received_at_ = mesh_received_at;
+            latest_mesh_source_timestamp_ =
+                mesh_source_timestamp;
             new_mesh_available_ = true;
         }
     }
@@ -644,6 +714,8 @@ private:
         cv::DISOpticalFlow::PRESET_ULTRAFAST;
     std::string interpolation_dis_preset_name_ = "ultrafast";
     bool interpolation_bidirectional_flow_ = false;
+    std::string interpolation_timing_source_ = "arrival";
+    bool interpolation_use_message_timestamps_ = false;
     bool interpolation_lock_camera_ = false;
     bool interpolation_show_source_window_ = false;
     std::string interpolation_window_suffix_ = " - DIS Interpolated";
@@ -655,6 +727,8 @@ private:
     std::mutex mutex_;
     std::shared_ptr<open3d::geometry::TriangleMesh> latest_mesh_;
     std::chrono::steady_clock::time_point latest_mesh_received_at_;
+    std::optional<std::chrono::nanoseconds>
+        latest_mesh_source_timestamp_;
     bool new_mesh_available_;
 
     rclcpp::Subscription<pc_msgs::msg::O3DMesh>::SharedPtr subscription_;
