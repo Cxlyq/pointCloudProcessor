@@ -1,13 +1,16 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@
 // 引入 Open3D 核心与可视化头文件
 #include "open3d/Open3D.h"
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video/tracking.hpp>
@@ -123,6 +127,18 @@ public:
 
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto camera_ids = this->get_parameter("camera_ids").as_string_array();
+        if (camera_ids.empty()) {
+            throw std::invalid_argument(
+                "camera_ids must contain at least one camera");
+        }
+        std::unordered_set<std::string> unique_camera_ids;
+        for (const auto& camera_id : camera_ids) {
+            if (camera_id.empty() ||
+                !unique_camera_ids.insert(camera_id).second) {
+                throw std::invalid_argument(
+                    "camera_ids must be non-empty and unique");
+            }
+        }
         fps_logging_enabled_ =
             this->get_parameter("fps_logging_enabled").as_bool();
         fps_logging_interval_sec_ =
@@ -148,7 +164,9 @@ public:
         interpolation_window_suffix_ =
             this->get_parameter("interpolation_window_suffix").as_string();
 
-        if (fps_logging_enabled_ && fps_logging_interval_sec_ <= 0.0) {
+        if (fps_logging_enabled_ &&
+            (!std::isfinite(fps_logging_interval_sec_) ||
+             fps_logging_interval_sec_ <= 0.0)) {
             throw std::invalid_argument(
                 "fps_logging_interval_sec must be greater than zero");
         }
@@ -158,6 +176,17 @@ public:
                 throw std::invalid_argument(
                     "interpolation_intermediate_frames must be "
                     "greater than or equal to zero");
+            }
+            if (interpolation_intermediate_frames_ > 120) {
+                throw std::invalid_argument(
+                    "interpolation_intermediate_frames must not "
+                    "exceed 120");
+            }
+            if (!std::isfinite(interpolation_flow_scale_) ||
+                interpolation_flow_scale_ <= 0.0 ||
+                interpolation_flow_scale_ > 1.0) {
+                throw std::invalid_argument(
+                    "interpolation_flow_scale must be in (0, 1]");
             }
             interpolation_dis_preset_ =
                 parse_dis_preset(interpolation_dis_preset_name_);
@@ -182,6 +211,27 @@ public:
         }
 
         // 2. 遍历参数，动态加载所有视角的窗口配置
+        const auto read_vector3_parameter =
+            [this](const std::string& parameter_name) {
+                const auto values =
+                    this->get_parameter(
+                        parameter_name).as_double_array();
+                if (values.size() != 3 ||
+                    !std::all_of(
+                        values.begin(),
+                        values.end(),
+                        [](double value) {
+                            return std::isfinite(value);
+                        })) {
+                    throw std::invalid_argument(
+                        parameter_name +
+                        " must contain exactly three finite values");
+                }
+                return Eigen::Vector3d(
+                    values[0], values[1], values[2]);
+            };
+
+        std::unordered_set<std::string> unique_window_names;
         for (const auto& cam_id : camera_ids) {
             CamConfig cfg;
             this->declare_parameter<std::string>(cam_id + ".name", "Render - " + cam_id);
@@ -195,23 +245,53 @@ public:
             this->declare_parameter<double>(cam_id + ".zoom", 0.7);
 
             cfg.name = this->get_parameter(cam_id + ".name").as_string();
+            if (cfg.name.empty() ||
+                !unique_window_names.insert(cfg.name).second) {
+                throw std::invalid_argument(
+                    "camera window names must be non-empty and unique");
+            }
             cfg.width = this->get_parameter(cam_id + ".width").as_int();
             cfg.height = this->get_parameter(cam_id + ".height").as_int();
+            if (cfg.width <= 0 || cfg.height <= 0) {
+                throw std::invalid_argument(
+                    cam_id + " width and height must be positive");
+            }
 
-            auto bg = this->get_parameter(cam_id + ".background_color").as_double_array();
-            cfg.bg_color = Eigen::Vector3d(bg[0], bg[1], bg[2]);
+            cfg.bg_color =
+                read_vector3_parameter(
+                    cam_id + ".background_color");
+            if ((cfg.bg_color.array() < 0.0).any() ||
+                (cfg.bg_color.array() > 1.0).any()) {
+                throw std::invalid_argument(
+                    cam_id +
+                    ".background_color values must be in [0, 1]");
+            }
             cfg.pt_size = this->get_parameter(cam_id + ".point_size").as_double();
+            if (!std::isfinite(cfg.pt_size) || cfg.pt_size <= 0.0) {
+                throw std::invalid_argument(
+                    cam_id +
+                    ".point_size must be positive and finite");
+            }
 
-            auto front = this->get_parameter(cam_id + ".front").as_double_array();
-            cfg.front = Eigen::Vector3d(front[0], front[1], front[2]);
-
-            auto lookat = this->get_parameter(cam_id + ".lookat").as_double_array();
-            cfg.lookat = Eigen::Vector3d(lookat[0], lookat[1], lookat[2]);
-
-            auto up = this->get_parameter(cam_id + ".up").as_double_array();
-            cfg.up = Eigen::Vector3d(up[0], up[1], up[2]);
+            cfg.front =
+                read_vector3_parameter(cam_id + ".front");
+            cfg.lookat =
+                read_vector3_parameter(cam_id + ".lookat");
+            cfg.up =
+                read_vector3_parameter(cam_id + ".up");
+            if (cfg.front.norm() <= 1e-9 ||
+                cfg.up.norm() <= 1e-9 ||
+                cfg.front.cross(cfg.up).norm() <= 1e-9) {
+                throw std::invalid_argument(
+                    cam_id +
+                    " front and up must be non-zero and non-parallel");
+            }
 
             cfg.zoom = this->get_parameter(cam_id + ".zoom").as_double();
+            if (!std::isfinite(cfg.zoom) || cfg.zoom <= 0.0) {
+                throw std::invalid_argument(
+                    cam_id + ".zoom must be positive and finite");
+            }
 
             // 实例化并创建 Open3D 窗口
             cfg.vis = std::make_shared<open3d::visualization::Visualizer>();
@@ -277,7 +357,9 @@ public:
 
         // 3. 订阅话题 (运行在 ROS 线程)
         subscription_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
-            sub_topic, 10, std::bind(&VisualizationNode::mesh_callback, this, _1)
+            sub_topic,
+            rclcpp::QoS(rclcpp::KeepLast(1)),
+            std::bind(&VisualizationNode::mesh_callback, this, _1)
         );
 
         RCLCPP_INFO(this->get_logger(), "[*] Visualization started. %zu windows have been brought up.", visualizers_.size());
@@ -352,6 +434,7 @@ public:
             const auto source_processing_started_at =
                 std::chrono::steady_clock::now();
 
+            try {
             if (mesh_to_render != nullptr) {
                 if (interpolation_enabled_) {
                     // Keep one Open3D geometry and update its buffers. Recreating
@@ -378,8 +461,11 @@ public:
                     }
                 } else {
                     item.vis->ClearGeometries();
-                    item.vis->AddGeometry(
-                        mesh_to_render, item.is_first_frame);
+                    if (!item.vis->AddGeometry(
+                            mesh_to_render, item.is_first_frame)) {
+                        throw std::runtime_error(
+                            "failed to add source mesh");
+                    }
                 }
 
                 // 光流要求相邻两张图使用相同视角；启用插帧时可锁定相机。
@@ -419,14 +505,23 @@ public:
                     }
                     cv::Mat rendered_frame =
                         open3d_float_rgb_to_bgr8(*captured_image);
-                    double maximum_pixel_value = 0.0;
+                    cv::Mat background_difference;
+                    cv::absdiff(
+                        rendered_frame,
+                        cv::Scalar(
+                            item.bg_color.z() * 255.0,
+                            item.bg_color.y() * 255.0,
+                            item.bg_color.x() * 255.0),
+                        background_difference);
+                    double maximum_background_difference = 0.0;
                     cv::minMaxLoc(
-                        rendered_frame.reshape(1),
+                        background_difference.reshape(1),
                         nullptr,
-                        &maximum_pixel_value);
-                    if (maximum_pixel_value <= 0.0) {
+                        &maximum_background_difference);
+                    if (maximum_background_difference <= 1.0) {
                         throw std::runtime_error(
-                            "Open3D captured an all-black source frame");
+                            "Open3D captured only the background; "
+                            "the source mesh was not rendered");
                     }
                     item.interpolator->SubmitFrame(
                         rendered_frame,
@@ -449,6 +544,12 @@ public:
                         "[!] Failed to capture rendered frame for interpolation: %s",
                         error.what());
                 }
+            }
+            } catch (const std::exception& error) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[!] Source visualization update failed: %s",
+                    error.what());
             }
 
             if (item.interpolator != nullptr) {
@@ -583,11 +684,13 @@ private:
         RCLCPP_INFO(
             this->get_logger(),
             "[FPS] Source \"%s\": %.2f FPS | %.1f s window | "
-            "max gap %.0f ms.",
+            "max gap %.0f ms | superseded meshes %llu.",
             item.name.c_str(),
             measured_fps,
             elapsed_sec,
-            window.maximum_gap_ms);
+            window.maximum_gap_ms,
+            static_cast<unsigned long long>(
+                superseded_mesh_count_.load()));
 
         InitializeFpsWindow(window, now);
     }
@@ -632,15 +735,22 @@ private:
                     window.playback_interval_count) /
                     window.playback_interval_sum_sec :
                 effective_fps;
+        const auto queue_stats =
+            item.interpolator->GetQueueStats();
         RCLCPP_INFO(
             this->get_logger(),
             "[FPS] Interpolated \"%s\": playback %.1f FPS | "
-            "effective %.1f FPS | %.1f s window | max gap %.0f ms.",
+            "effective %.1f FPS | %.1f s window | max gap %.0f ms | "
+            "coalesced %llu | queue %zu pending / %zu ready.",
             item.interpolation_window_name.c_str(),
             playback_fps,
             effective_fps,
             elapsed_sec,
-            window.maximum_gap_ms);
+            window.maximum_gap_ms,
+            static_cast<unsigned long long>(
+                queue_stats.coalesced_source_frames),
+            queue_stats.pending_pairs,
+            queue_stats.ready_sequences);
 
         InitializeFpsWindow(window, now);
     }
@@ -648,6 +758,33 @@ private:
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
         const auto mesh_received_at =
             std::chrono::steady_clock::now();
+        if (msg->vertices.empty() ||
+            msg->vertices.size() % 3 != 0) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] Rejected mesh with an empty or malformed "
+                "vertex array.");
+            return;
+        }
+        if (msg->triangles.empty() ||
+            msg->triangles.size() % 3 != 0) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] Rejected mesh with an empty or malformed "
+                "triangle array.");
+            return;
+        }
+        if ((!msg->vertex_normals.empty() &&
+             msg->vertex_normals.size() != msg->vertices.size()) ||
+            (!msg->vertex_colors.empty() &&
+             msg->vertex_colors.size() != msg->vertices.size())) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] Rejected mesh whose normal/color count does "
+                "not match its vertex count.");
+            return;
+        }
+
         std::optional<std::chrono::nanoseconds>
             mesh_source_timestamp;
         if (msg->header.stamp.sec != 0 ||
@@ -665,6 +802,14 @@ private:
         size_t num_vertices = msg->vertices.size() / 3;
         mesh->vertices_.reserve(num_vertices);
         for (size_t i = 0; i < num_vertices; ++i) {
+            if (!std::isfinite(msg->vertices[i*3]) ||
+                !std::isfinite(msg->vertices[i*3+1]) ||
+                !std::isfinite(msg->vertices[i*3+2])) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "[?] Rejected mesh containing a non-finite vertex.");
+                return;
+            }
             mesh->vertices_.emplace_back(msg->vertices[i*3], msg->vertices[i*3+1], msg->vertices[i*3+2]);
         }
 
@@ -672,6 +817,21 @@ private:
         size_t num_triangles = msg->triangles.size() / 3;
         mesh->triangles_.reserve(num_triangles);
         for (size_t i = 0; i < num_triangles; ++i) {
+            const auto first_index = msg->triangles[i*3];
+            const auto second_index = msg->triangles[i*3+1];
+            const auto third_index = msg->triangles[i*3+2];
+            if (first_index < 0 ||
+                second_index < 0 ||
+                third_index < 0 ||
+                static_cast<size_t>(first_index) >= num_vertices ||
+                static_cast<size_t>(second_index) >= num_vertices ||
+                static_cast<size_t>(third_index) >= num_vertices) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "[?] Rejected mesh containing an out-of-range "
+                    "triangle index.");
+                return;
+            }
             mesh->triangles_.emplace_back(msg->triangles[i*3], msg->triangles[i*3+1], msg->triangles[i*3+2]);
         }
 
@@ -680,6 +840,15 @@ private:
             size_t num_normals = msg->vertex_normals.size() / 3;
             mesh->vertex_normals_.reserve(num_normals);
             for (size_t i = 0; i < num_normals; ++i) {
+                if (!std::isfinite(msg->vertex_normals[i*3]) ||
+                    !std::isfinite(msg->vertex_normals[i*3+1]) ||
+                    !std::isfinite(msg->vertex_normals[i*3+2])) {
+                    RCLCPP_WARN(
+                        this->get_logger(),
+                        "[?] Rejected mesh containing a non-finite "
+                        "vertex normal.");
+                    return;
+                }
                 mesh->vertex_normals_.emplace_back(msg->vertex_normals[i*3], msg->vertex_normals[i*3+1], msg->vertex_normals[i*3+2]);
             }
         }
@@ -689,6 +858,15 @@ private:
             size_t num_colors = msg->vertex_colors.size() / 3;
             mesh->vertex_colors_.reserve(num_colors);
             for (size_t i = 0; i < num_colors; ++i) {
+                if (!std::isfinite(msg->vertex_colors[i*3]) ||
+                    !std::isfinite(msg->vertex_colors[i*3+1]) ||
+                    !std::isfinite(msg->vertex_colors[i*3+2])) {
+                    RCLCPP_WARN(
+                        this->get_logger(),
+                        "[?] Rejected mesh containing a non-finite "
+                        "vertex color.");
+                    return;
+                }
                 mesh->vertex_colors_.emplace_back(msg->vertex_colors[i*3], msg->vertex_colors[i*3+1], msg->vertex_colors[i*3+2]);
             }
         }
@@ -696,6 +874,9 @@ private:
         // 5. 线程安全的数据投递
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (new_mesh_available_) {
+                ++superseded_mesh_count_;
+            }
             latest_mesh_ = mesh;
             latest_mesh_received_at_ = mesh_received_at;
             latest_mesh_source_timestamp_ =
@@ -729,6 +910,7 @@ private:
     std::chrono::steady_clock::time_point latest_mesh_received_at_;
     std::optional<std::chrono::nanoseconds>
         latest_mesh_source_timestamp_;
+    std::atomic<std::uint64_t> superseded_mesh_count_{0};
     bool new_mesh_available_;
 
     rclcpp::Subscription<pc_msgs::msg::O3DMesh>::SharedPtr subscription_;

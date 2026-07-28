@@ -14,8 +14,14 @@ namespace pointcloud_visualization {
 
 DisFrameInterpolator::DisFrameInterpolator(DisInterpolationConfig config)
     : config_(std::move(config)) {
-    if (config_.flow_scale <= 0.0 || config_.flow_scale > 1.0) {
+    if (!std::isfinite(config_.flow_scale) ||
+        config_.flow_scale <= 0.0 ||
+        config_.flow_scale > 1.0) {
         throw std::invalid_argument("interpolation flow_scale must be in (0, 1]");
+    }
+    if (config_.intermediate_frame_count > 120) {
+        throw std::invalid_argument(
+            "interpolation intermediate_frame_count must not exceed 120");
     }
     if (config_.max_pending_pairs == 0 || config_.max_ready_sequences == 0) {
         throw std::invalid_argument("interpolation queue limits must be greater than zero");
@@ -48,23 +54,27 @@ void DisFrameInterpolator::SubmitFrame(
         return;
     }
 
+    // Own one immutable copy of the renderer buffer. All queued cv::Mat
+    // instances below share this reference-counted storage instead of cloning
+    // the same real frame several times.
+    cv::Mat immutable_frame = bgr_frame.clone();
     bool has_new_pair = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (previous_real_frame_.empty()) {
-            previous_real_frame_ = bgr_frame.clone();
+            previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
 
             FrameSequence first_frame;
-            first_frame.frames.push_back(previous_real_frame_.clone());
+            first_frame.frames.push_back(previous_real_frame_);
             ready_sequences_.push_back(std::move(first_frame));
             return;
         }
 
-        if (previous_real_frame_.size() != bgr_frame.size()) {
+        if (previous_real_frame_.size() != immutable_frame.size()) {
             ++generation_;
-            previous_real_frame_ = bgr_frame.clone();
+            previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
             source_timestamp_fallback_active_ = false;
@@ -74,7 +84,7 @@ void DisFrameInterpolator::SubmitFrame(
             active_frame_index_ = 0;
 
             FrameSequence reset_frame;
-            reset_frame.frames.push_back(previous_real_frame_.clone());
+            reset_frame.frames.push_back(previous_real_frame_);
             ready_sequences_.push_back(std::move(reset_frame));
             last_error_ = "rendered frame size changed; interpolation state was reset";
             condition_.notify_all();
@@ -107,18 +117,19 @@ void DisFrameInterpolator::SubmitFrame(
             // pair. For example, replace C->D with C->E so that a preceding
             // B->C sequence still connects to the newest accepted frame.
             FramePair& newest_pending_pair = pending_pairs_.back();
-            newest_pending_pair.second = bgr_frame.clone();
+            newest_pending_pair.second = immutable_frame;
             newest_pending_pair.source_interval += source_delta;
+            ++coalesced_source_frames_;
         } else {
             pending_pairs_.push_back(
                 FramePair{
-                    previous_real_frame_.clone(),
-                    bgr_frame.clone(),
+                    previous_real_frame_,
+                    immutable_frame,
                     source_delta,
                     generation_});
         }
 
-        previous_real_frame_ = bgr_frame.clone();
+        previous_real_frame_ = immutable_frame;
         previous_frame_arrival_time_ = frame_arrival_time;
         previous_source_timestamp_ = source_timestamp;
         has_new_pair = true;
@@ -204,6 +215,14 @@ std::string DisFrameInterpolator::ConsumeStatus() {
     return status;
 }
 
+DisQueueStats DisFrameInterpolator::GetQueueStats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return DisQueueStats{
+        coalesced_source_frames_,
+        pending_pairs_.size(),
+        ready_sequences_.size()};
+}
+
 void DisFrameInterpolator::WorkerLoop() {
     while (true) {
         FramePair pair;
@@ -243,7 +262,7 @@ void DisFrameInterpolator::WorkerLoop() {
             SetStatus(status.str());
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
-            fallback.frames.push_back(pair.second.clone());
+            fallback.frames.push_back(pair.second);
             if (PushReadySequence(
                     std::move(fallback), pair.generation)) {
                 SetError(
@@ -252,7 +271,7 @@ void DisFrameInterpolator::WorkerLoop() {
             }
         } catch (const std::exception& error) {
             FrameSequence fallback;
-            fallback.frames.push_back(pair.second.clone());
+            fallback.frames.push_back(pair.second);
             if (PushReadySequence(
                     std::move(fallback), pair.generation)) {
                 SetError(
@@ -271,6 +290,12 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
     if (pair.first.size() != pair.second.size() ||
         pair.first.type() != pair.second.type()) {
         throw std::invalid_argument("interpolation pair has incompatible frames");
+    }
+
+    if (config_.intermediate_frame_count == 0) {
+        FrameSequence passthrough;
+        passthrough.frames.push_back(pair.second);
+        return passthrough;
     }
 
     const int minimum_flow_dimension = 8;
@@ -409,7 +434,7 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         sequence.frames.push_back(std::move(blended));
     }
 
-    sequence.frames.push_back(pair.second.clone());
+    sequence.frames.push_back(pair.second);
     return sequence;
 }
 

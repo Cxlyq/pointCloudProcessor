@@ -22,12 +22,18 @@ struct DisInterpolationConfig {
     bool use_bidirectional_flow = false;
     bool use_source_timestamps = false;
     cv::Scalar border_color_bgr = cv::Scalar(0.0, 0.0, 0.0);
-    std::size_t max_pending_pairs = 2;
-    std::size_t max_ready_sequences = 2;
+    std::size_t max_pending_pairs = 1;
+    std::size_t max_ready_sequences = 1;
 };
 
 struct DisDisplayTiming {
     bool starts_new_sequence = false;
+};
+
+struct DisQueueStats {
+    std::uint64_t coalesced_source_frames = 0;
+    std::size_t pending_pairs = 0;
+    std::size_t ready_sequences = 0;
 };
 
 class DisFrameInterpolator {
@@ -48,6 +54,7 @@ public:
         DisDisplayTiming* timing = nullptr);
     std::string ConsumeStatus();
     std::string ConsumeError();
+    DisQueueStats GetQueueStats();
 
 private:
     struct FramePair {
@@ -81,6 +88,7 @@ private:
     std::optional<std::chrono::nanoseconds>
         previous_source_timestamp_;
     bool source_timestamp_fallback_active_ = false;
+    std::uint64_t coalesced_source_frames_ = 0;
     std::deque<FramePair> pending_pairs_;
     std::deque<FrameSequence> ready_sequences_;
     std::string last_status_;
