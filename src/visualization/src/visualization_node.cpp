@@ -382,7 +382,7 @@ public:
                         [this]() {
                             NotifyPresentationThread();
                         });
-                rclcpp::QoS image_qos(rclcpp::KeepAll());
+                rclcpp::QoS image_qos{rclcpp::KeepAll()};
                 image_qos.reliable();
                 cfg.interpolation_frame_publisher =
                     this->create_publisher<

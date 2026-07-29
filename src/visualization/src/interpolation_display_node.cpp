@@ -138,7 +138,7 @@ public:
             windows_.push_back(std::move(state));
         }
 
-        rclcpp::QoS image_qos(rclcpp::KeepAll());
+        rclcpp::QoS image_qos{rclcpp::KeepAll()};
         image_qos.reliable();
         for (std::size_t index = 0;
              index < windows_.size();
