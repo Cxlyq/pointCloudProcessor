@@ -53,6 +53,7 @@ target_include_directories(interpolation_display_node PUBLIC
 )
 target_link_libraries(interpolation_display_node
         ${OpenCV_LIBS}
+        Threads::Threads
 )
 target_compile_features(
   interpolation_display_node PUBLIC cxx_std_17)

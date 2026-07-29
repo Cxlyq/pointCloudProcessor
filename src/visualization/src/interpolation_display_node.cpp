@@ -1,10 +1,12 @@
 #include "visualization/ros_image_conversion.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -16,6 +18,7 @@
 namespace {
 
 constexpr char kInterpolatedFrameTopic[] = "interpolated_frames";
+constexpr auto kNoWindowPollInterval = std::chrono::milliseconds(5);
 
 struct WindowState {
     std::string camera_id;
@@ -114,8 +117,11 @@ public:
     }
 
     bool PresentReadyFramesAndProcessEvents() {
+        bool has_created_window = false;
         for (auto& state : windows_) {
             if (state.pending_frame == nullptr) {
+                has_created_window =
+                    has_created_window || state.created;
                 continue;
             }
 
@@ -146,6 +152,16 @@ public:
                     state.window_name.c_str(),
                     error.what());
             }
+            has_created_window =
+                has_created_window || state.created;
+        }
+
+        if (!has_created_window) {
+            // waitKey does not provide a portable delay until at least one
+            // HighGUI window exists, so explicitly throttle the no-frame
+            // startup path.
+            std::this_thread::sleep_for(kNoWindowPollInterval);
+            return true;
         }
 
         const int key = cv::waitKey(1);
