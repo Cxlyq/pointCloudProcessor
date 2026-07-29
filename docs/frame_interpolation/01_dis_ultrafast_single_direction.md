@@ -33,7 +33,7 @@ DIS 预设：ULTRAFAST
   - 在独立 ROS 2 进程的主线程创建和更新 HighGUI 窗口；
   - ROS 接收线程与 HighGUI 主线程分离，DDS 只传真实源帧；
   - 本地 worker 生成完整插值序列，主线程按顺序逐帧消费；
-  - 默认使用主线程 `pollKey()` 并记录 HighGUI 阻塞耗时。
+  - 默认使用主线程 `waitKey(1)` 并记录 HighGUI 阻塞耗时。
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
@@ -100,7 +100,7 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 | `interpolation_timing_source` | `message_stamp` | 使用发布端源帧时间戳计算播放步长 |
 | `interpolation_pending_pair_capacity` | `3` | 待生成源帧对容量；满时阻塞反压，不合并帧对 |
 | `interpolation_ready_sequence_capacity` | `2` | 已生成完整序列容量；满时等待显示端，不删除序列 |
-| `interpolation_highgui_event_mode` | `poll_key` | 在显示主线程处理并测量 HighGUI 事件 |
+| `interpolation_highgui_event_mode` | `wait_key` | 在显示主线程通过 `waitKey(1)` 处理并测量 HighGUI 事件 |
 | `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
 | `interpolation_show_source_window` | `false` | 是否显示仅用于调试的 Open3D 源窗口 |
 

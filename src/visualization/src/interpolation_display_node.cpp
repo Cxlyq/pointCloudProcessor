@@ -189,7 +189,9 @@ public:
                 "interpolation_ready_sequence_capacity", 2);
         configured_highgui_event_mode_ = Lowercase(
             this->declare_parameter<std::string>(
-                "interpolation_highgui_event_mode", "poll_key"));
+                "interpolation_highgui_event_mode", "wait_key"));
+        use_wait_key_event_pump_ =
+            configured_highgui_event_mode_ == "wait_key";
 
         if (fps_logging_enabled_ &&
             (!std::isfinite(fps_logging_interval_sec_) ||
@@ -230,12 +232,13 @@ public:
             throw std::invalid_argument(
                 "interpolation_ready_sequence_capacity must be in [1, 1000]");
         }
-        if (configured_highgui_event_mode_ != "poll_key" &&
+        if (configured_highgui_event_mode_ != "wait_key" &&
+            configured_highgui_event_mode_ != "poll_key" &&
             configured_highgui_event_mode_ !=
                 "start_window_thread") {
             throw std::invalid_argument(
-                "interpolation_highgui_event_mode must be poll_key "
-                "or start_window_thread");
+                "interpolation_highgui_event_mode must be wait_key, "
+                "poll_key, or start_window_thread");
         }
 
         intermediate_frame_count_ =
@@ -372,9 +375,11 @@ public:
             ready_sequence_capacity_);
         RCLCPP_INFO(
             this->get_logger(),
-            "[*] All imshow/event calls run on the display main thread; "
-            "HighGUI mode is %s.",
-            configured_highgui_event_mode_.c_str());
+            "[*] HighGUI requested mode is %s with OpenCV %s. The "
+            "active event-pump mode is logged after the first window "
+            "is created.",
+            configured_highgui_event_mode_.c_str(),
+            CV_VERSION);
         if (fps_logging_enabled_) {
             RCLCPP_INFO(
                 this->get_logger(),
@@ -475,14 +480,18 @@ public:
             !highgui_event_thread_started_) {
             const auto event_started_at =
                 std::chrono::steady_clock::now();
+            if (use_wait_key_event_pump_) {
+                key = cv::waitKey(1);
+            } else {
 #if CV_VERSION_MAJOR > 4 || \
     (CV_VERSION_MAJOR == 4 && \
      (CV_VERSION_MINOR > 5 || \
       (CV_VERSION_MINOR == 5 && CV_VERSION_REVISION >= 1)))
-            key = cv::pollKey();
+                key = cv::pollKey();
 #else
-            key = cv::waitKey(1);
+                key = cv::waitKey(1);
 #endif
+            }
             presentation_boundary =
                 std::chrono::steady_clock::now();
             event_ms =
@@ -686,7 +695,18 @@ private:
             RCLCPP_WARN(
                 this->get_logger(),
                 "[?] HighGUI backend does not support an event thread; "
-                "falling back to main-thread event pumping.");
+                "falling back to measured main-thread waitKey(1).");
+            use_wait_key_event_pump_ = true;
+        }
+
+        if (use_wait_key_event_pump_) {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[*] HighGUI events are pumped with waitKey(1) on the "
+                "display main thread. This avoids the long pollKey() "
+                "cycle observed in the current runtime while preserving "
+                "a measured display boundary.");
+            return;
         }
 
 #if CV_VERSION_MAJOR > 4 || \
@@ -702,7 +722,17 @@ private:
             this->get_logger(),
             "[?] OpenCV predates pollKey(); HighGUI events use the "
             "measured waitKey(1) fallback.");
+        use_wait_key_event_pump_ = true;
 #endif
+    }
+
+    const char* ActiveHighGuiEventMode() const noexcept {
+        if (highgui_event_thread_started_) {
+            return "window-thread";
+        }
+        return use_wait_key_event_pump_ ?
+            "main-thread-waitKey(1)" :
+            "main-thread-pollKey()";
     }
 
     std::chrono::steady_clock::duration CalculateNextWaitDuration(
@@ -1061,8 +1091,7 @@ private:
             stats.maximum_event_ms,
             static_cast<unsigned long long>(
                 stats.window_slow_event_calls),
-            highgui_event_thread_started_ ?
-                "window-thread" : "main-thread",
+            ActiveHighGuiEventMode(),
             queue_stats.pending_pairs,
             queue_stats.maximum_pending_pairs,
             pending_pair_capacity_,
@@ -1158,9 +1187,10 @@ private:
     std::size_t ready_sequence_capacity_ = 2;
     bool fps_logging_enabled_ = true;
     double fps_logging_interval_sec_ = 5.0;
-    std::string configured_highgui_event_mode_ = "poll_key";
+    std::string configured_highgui_event_mode_ = "wait_key";
     bool highgui_backend_initialized_ = false;
     bool highgui_event_thread_started_ = false;
+    bool use_wait_key_event_pump_ = true;
     std::chrono::steady_clock::time_point
         last_highgui_slow_warning_at_;
 };

@@ -26,7 +26,7 @@ interpolation_bidirectional_flow: false
 interpolation_timing_source: "message_stamp"
 interpolation_pending_pair_capacity: 3
 interpolation_ready_sequence_capacity: 2
-interpolation_highgui_event_mode: "poll_key"
+interpolation_highgui_event_mode: "wait_key"
 ```
 
 19 张中间帧复用同一份光流，不会执行 19 次光流计算。相对基础版，新增开销主要来自：

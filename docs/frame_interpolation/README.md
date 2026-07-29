@@ -69,13 +69,17 @@ interpolation_ready_sequence_capacity: 2
 默认配置为：
 
 ```yaml
-interpolation_highgui_event_mode: "poll_key"
+interpolation_highgui_event_mode: "wait_key"
 ```
 
-窗口创建、`imshow()` 和事件处理全部位于显示进程主线程。OpenCV
-4.5.1 及以上使用 `pollKey()`；更旧版本使用可测量的 `waitKey(1)`
-回退。也可以显式配置 `start_window_thread` 做后端对比，但正式诊断
-默认使用主线程事件处理，以便把阻塞耗时完整记录出来。
+窗口创建、`imshow()` 和事件处理全部位于显示进程主线程。一次实测中，
+`pollKey()` 每轮耗时达到 700～1100 ms，而 `imshow()` 只有 1～4 ms，
+因此正式 ×5 配置改为调用 `waitKey(1)`。它仍会处理 HighGUI 事件并纳入
+显示边界计时，但不会沿用这次运行中表现异常的 `pollKey()` 路径。
+
+`poll_key` 保留为诊断对照。也可以显式配置 `start_window_thread`；若当前
+HighGUI 后端不支持事件线程，程序会自动回退到主线程 `waitKey(1)`。启动
+日志和 `[PIPE]` 会分别报告请求模式与实际生效模式。
 
 ## 日志
 
@@ -107,6 +111,7 @@ source missing = 0
 out-of-order = 0
 display sequence breaks = 0
 source backpressure = 0（正常负载）
+[PIPE] mode main-thread-waitKey(1)
 ```
 
 如果 `source missing > 0`，帧丢在发布之后、显示回调之前，应继续检查
@@ -114,6 +119,8 @@ DDS。若缺失和序列断裂均为 0，但 `imshow` 或 event 的最大耗时�
 数百毫秒、`presented` 明显低于目标，则最终瓶颈仍在 HighGUI。若
 pending/ready 长期满且 `source backpressure` 为 `ACTIVE`，说明最终
 消费能力低于输入需求；此时帧仍保持连续，但端到端延迟会继续增长。
+本轮修复验证时，还应确认 event 平均/最大耗时不再维持在
+700～1100 ms，且 source backlog 和 newest-source age 不再持续增长。
 
 ## 构建与测试
 
