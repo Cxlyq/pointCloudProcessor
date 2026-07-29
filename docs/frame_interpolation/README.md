@@ -92,10 +92,10 @@ fps_logging_interval_sec: 5.0
 interpolation_display_backend: "auto"
 ```
 
-Windows 下 `auto` 使用同进程、同 UI 线程的原生 GDI 窗口，绕过可能长时间阻塞的
-OpenCV HighGUI；其他平台自动回退到 HighGUI。可将参数显式设为 `highgui` 做对照。
-原生窗口同步完成当前帧绘制，不创建独立 DDS 显示节点，也不使用“只保留最新显示帧”的
-后台线程。
+Windows 下 `auto` 使用原生 GDI 窗口，Linux 下使用原生 X11 窗口；两者都在同一进程、
+同一 UI 线程中绕过可能长时间阻塞的 OpenCV HighGUI。其他平台自动回退到 HighGUI，
+也可将参数显式设为 `highgui` 做对照。Linux 编译需要 X11 开发包（Ubuntu/Debian 为
+`libx11-dev`）。原生窗口不创建独立 DDS 显示节点，也不使用“只保留最新显示帧”的后台线程。
 
 日志按处理阶段拆分：
 
@@ -114,7 +114,7 @@ OpenCV HighGUI；其他平台自动回退到 HighGUI。可将参数显式设为 
 [RX] Accepted mesh: 1.96 FPS | 5.1 s window | max gap 530 ms | callback avg/max 18.0/24.0 ms
 [RENDER] "...": 10 source frames | age avg/max 12.0/35.0 ms | geometry 20.0/31.0 | capture 85.0/122.0 ms
 [GEN] Bidirectional DIS: sequence 12 source 12->13 | span 505.0 ms | coalesced 0 | 4 intermediate display frames in 75.0 ms
-[DISPLAY] "...": backend native-win32 | submit 9.5 FPS | playback 9.7 FPS | max gap 135 ms | present avg/max 2.0/8.0 ms
+[DISPLAY] "...": backend native-x11 | submit 9.5 FPS | playback 9.7 FPS | max gap 135 ms | present avg/max 2.0/8.0 ms
 [PIPE] Last S12 5/5 source 12->13 | queue 0 pending / 0 ready / 0 active | worker idle
 ```
 

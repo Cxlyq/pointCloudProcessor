@@ -8,8 +8,8 @@
 namespace pointcloud_visualization {
 
 // A small same-thread image window used to bypass blocking OpenCV HighGUI
-// backends. The implementation is available on Windows and compiles to an
-// unsupported stub elsewhere so that "auto" can retain the HighGUI fallback.
+// backends. Windows uses GDI and Linux uses X11; unsupported platforms compile
+// to a stub so that "auto" can retain the HighGUI fallback.
 class NativeFrameWindow {
 public:
     NativeFrameWindow();
@@ -19,6 +19,7 @@ public:
     NativeFrameWindow& operator=(const NativeFrameWindow&) = delete;
 
     static bool IsSupported();
+    static const char* BackendName();
 
     bool Create(
         const std::string& title,

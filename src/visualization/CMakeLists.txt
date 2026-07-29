@@ -15,6 +15,9 @@ find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc video)
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
 find_package(Open3D REQUIRED)
 
+if(UNIX AND NOT APPLE)
+  find_package(X11 REQUIRED)
+endif()
 
 add_executable(visualization_node
         src/visualization_node.cpp
@@ -39,6 +42,16 @@ if(WIN32)
   target_link_libraries(visualization_node
           user32
           gdi32
+  )
+elseif(UNIX AND NOT APPLE)
+  target_compile_definitions(visualization_node PRIVATE
+          VISUALIZATION_NATIVE_X11=1
+  )
+  target_include_directories(visualization_node PRIVATE
+          ${X11_INCLUDE_DIR}
+  )
+  target_link_libraries(visualization_node
+          ${X11_LIBRARIES}
   )
 endif()
 target_compile_features(visualization_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17

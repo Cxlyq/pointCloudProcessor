@@ -338,7 +338,9 @@ public:
             }
             interpolation_display_backend_resolved_ =
                 interpolation_use_native_display_ ?
-                    "native-win32" : "highgui";
+                    pointcloud_visualization::NativeFrameWindow::
+                        BackendName() :
+                    "highgui";
             std::transform(
                 interpolation_timing_source_.begin(),
                 interpolation_timing_source_.end(),
