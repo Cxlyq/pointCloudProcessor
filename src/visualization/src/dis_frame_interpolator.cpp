@@ -93,20 +93,25 @@ DisFrameInterpolator::DisFrameInterpolator(
 }
 
 DisFrameInterpolator::~DisFrameInterpolator() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopping_ = true;
-    }
-    condition_.notify_all();
+    RequestStop();
     if (worker_.joinable()) {
         worker_.join();
     }
 }
 
+void DisFrameInterpolator::RequestStop() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    condition_.notify_all();
+}
+
 void DisFrameInterpolator::SubmitFrame(
     const cv::Mat& bgr_frame,
     std::chrono::steady_clock::time_point frame_arrival_time,
-    std::optional<std::chrono::nanoseconds> source_timestamp) {
+    std::optional<std::chrono::nanoseconds> source_timestamp,
+    std::optional<std::uint64_t> source_sequence) {
     if (bgr_frame.empty()) {
         SetError("cannot interpolate an empty rendered frame");
         return;
@@ -124,18 +129,28 @@ void DisFrameInterpolator::SubmitFrame(
     bool notify_all_workers = false;
     bool notify_ready = false;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (stopping_) {
+            return;
+        }
         if (previous_real_frame_.empty()) {
             previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
+            previous_source_sequence_ = source_sequence;
 
             FrameSequence first_frame;
             // The returned display frame is writable from OpenCV's point of
             // view. Give the display queue its own storage so a future overlay
             // cannot mutate the real-frame endpoint retained for interpolation.
             first_frame.frames.push_back(previous_real_frame_.clone());
+            first_frame.newest_source_arrival_time =
+                frame_arrival_time;
+            first_frame.source_sequence_start = source_sequence;
+            first_frame.source_sequence_end = source_sequence;
             ready_sequences_.push_back(std::move(first_frame));
+            maximum_ready_sequences_ = std::max(
+                maximum_ready_sequences_, ready_sequences_.size());
             notify_ready = true;
         } else if (
             previous_real_frame_.size() != immutable_frame.size()) {
@@ -143,15 +158,28 @@ void DisFrameInterpolator::SubmitFrame(
             previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
+            previous_source_sequence_ = source_sequence;
             source_timestamp_fallback_active_ = false;
             pending_pairs_.clear();
             ready_sequences_.clear();
             active_frames_.clear();
             active_frame_index_ = 0;
+            active_frame_period_ = {};
+            active_source_interval_ = {};
+            active_newest_source_arrival_time_.reset();
+            active_source_sequence_start_.reset();
+            active_source_sequence_end_.reset();
+            playback_timeline_initialized_ = false;
 
             FrameSequence reset_frame;
             reset_frame.frames.push_back(previous_real_frame_.clone());
+            reset_frame.newest_source_arrival_time =
+                frame_arrival_time;
+            reset_frame.source_sequence_start = source_sequence;
+            reset_frame.source_sequence_end = source_sequence;
             ready_sequences_.push_back(std::move(reset_frame));
+            maximum_ready_sequences_ = std::max(
+                maximum_ready_sequences_, ready_sequences_.size());
             last_error_ = "rendered frame size changed; interpolation state was reset";
             notify_all_workers = true;
             notify_ready = true;
@@ -178,32 +206,49 @@ void DisFrameInterpolator::SubmitFrame(
                 }
             }
 
-            if (pending_pairs_.size() >= config_.max_pending_pairs) {
-                // Preserve the sequence boundary instead of dropping an
-                // interior pair. For example, replace C->D with C->E so that a
-                // preceding B->C sequence still connects to the newest
-                // accepted frame. Track how many adjacent source intervals
-                // were merged so playback can use their average interval
-                // instead of reducing its nominal frame rate in proportion to
-                // the number of coalesced frames.
-                FramePair& newest_pending_pair = pending_pairs_.back();
-                newest_pending_pair.second = immutable_frame;
-                newest_pending_pair.source_interval_sum += source_delta;
-                ++newest_pending_pair.source_interval_count;
-                ++coalesced_source_frames_;
-            } else {
-                pending_pairs_.push_back(
-                    FramePair{
-                        previous_real_frame_,
-                        immutable_frame,
-                        source_delta,
-                        1,
-                        generation_});
+            if (pending_pairs_.size() >=
+                config_.max_pending_pairs) {
+                ++source_backpressure_waits_;
+                const auto wait_started_at =
+                    std::chrono::steady_clock::now();
+                source_backpressure_started_at_ =
+                    wait_started_at;
+                condition_.wait(lock, [this]() {
+                    return stopping_ ||
+                           pending_pairs_.size() <
+                               config_.max_pending_pairs;
+                });
+                const auto wait_duration =
+                    std::chrono::steady_clock::now() -
+                    wait_started_at;
+                source_backpressure_wait_duration_ +=
+                    wait_duration;
+                maximum_source_backpressure_wait_duration_ =
+                    std::max(
+                        maximum_source_backpressure_wait_duration_,
+                        wait_duration);
+                source_backpressure_started_at_.reset();
+                if (stopping_) {
+                    return;
+                }
             }
+
+            pending_pairs_.push_back(
+                FramePair{
+                    previous_real_frame_,
+                    immutable_frame,
+                    source_delta,
+                    frame_arrival_time,
+                    previous_source_sequence_,
+                    source_sequence,
+                    generation_});
+            maximum_pending_pairs_ = std::max(
+                maximum_pending_pairs_, pending_pairs_.size());
 
             previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
+            previous_source_sequence_ = source_sequence;
             notify_worker = true;
         }
     }
@@ -249,6 +294,14 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
 
             active_frames_ = std::move(sequence.frames);
             active_frame_period_ = sequence.frame_period;
+            active_source_interval_ =
+                sequence.source_interval;
+            active_newest_source_arrival_time_ =
+                sequence.newest_source_arrival_time;
+            active_source_sequence_start_ =
+                sequence.source_sequence_start;
+            active_source_sequence_end_ =
+                sequence.source_sequence_end;
             active_frame_index_ = 0;
             if (sequence.delay_before_first_frame) {
                 next_frame_deadline_ =
@@ -281,6 +334,17 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
     if (timing != nullptr) {
         timing->starts_new_sequence =
             active_frame_index_ == 0;
+        timing->frame_index = active_frame_index_ + 1;
+        timing->frame_count = active_frames_.size();
+        timing->source_sequence_start =
+            active_source_sequence_start_;
+        timing->source_sequence_end =
+            active_source_sequence_end_;
+        timing->newest_source_arrival_time =
+            active_newest_source_arrival_time_;
+        timing->source_interval_ms =
+            std::chrono::duration<double, std::milli>(
+                active_source_interval_).count();
     }
     display_frame =
         active_frames_[active_frame_index_];
@@ -294,6 +358,10 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
             std::move(active_frames_));
         active_frames_.clear();
         active_frame_index_ = 0;
+        active_source_interval_ = {};
+        active_newest_source_arrival_time_.reset();
+        active_source_sequence_start_.reset();
+        active_source_sequence_end_.reset();
         playback_timeline_initialized_ = false;
         activate_next_sequence();
     } else {
@@ -340,10 +408,33 @@ DisQueueStats DisFrameInterpolator::GetQueueStats() {
                 now - next_frame_deadline_).count();
     }
 
+    auto total_backpressure_wait =
+        source_backpressure_wait_duration_;
+    auto maximum_backpressure_wait =
+        maximum_source_backpressure_wait_duration_;
+    if (source_backpressure_started_at_.has_value()) {
+        const auto active_wait =
+            now - *source_backpressure_started_at_;
+        total_backpressure_wait += active_wait;
+        maximum_backpressure_wait = std::max(
+            maximum_backpressure_wait, active_wait);
+    }
+
     DisQueueStats stats;
-    stats.coalesced_source_frames = coalesced_source_frames_;
+    stats.source_backpressure_waits =
+        source_backpressure_waits_;
+    stats.source_backpressure_wait_ms =
+        std::chrono::duration<double, std::milli>(
+            total_backpressure_wait).count();
+    stats.maximum_source_backpressure_wait_ms =
+        std::chrono::duration<double, std::milli>(
+            maximum_backpressure_wait).count();
+    stats.source_backpressure_active =
+        source_backpressure_started_at_.has_value();
     stats.pending_pairs = pending_pairs_.size();
+    stats.maximum_pending_pairs = maximum_pending_pairs_;
     stats.ready_sequences = ready_sequences_.size();
+    stats.maximum_ready_sequences = maximum_ready_sequences_;
     stats.worker_busy = worker_busy_;
     stats.active_frames_remaining = active_frames_remaining;
     stats.playback_lag_ms = playback_lag_ms;
@@ -358,7 +449,7 @@ DisFrameInterpolator::GetNextDisplayDeadline() {
         return next_frame_deadline_;
     }
     if (!ready_sequences_.empty()) {
-        // The presentation thread must activate the sequence before its exact
+        // The display scheduler must activate the sequence before its exact
         // first-frame deadline can be known.
         return std::chrono::steady_clock::now();
     }
@@ -382,6 +473,9 @@ void DisFrameInterpolator::WorkerLoop() {
             pending_pairs_.pop_front();
             worker_busy_ = true;
         }
+        // A source callback may be waiting for bounded pending capacity.
+        // Wake it as soon as the oldest pair has been claimed by the worker.
+        condition_.notify_all();
 
         FrameSequence sequence;
         std::string success_status;
@@ -402,17 +496,50 @@ void DisFrameInterpolator::WorkerLoop() {
                    << ": " << config_.intermediate_frame_count
                    << " intermediate display frames in "
                    << std::fixed << std::setprecision(1)
-                   << elapsed_ms << " ms";
+                   << elapsed_ms << " ms"
+                   << " | source interval "
+                   << std::chrono::duration<double, std::milli>(
+                          pair.source_interval).count()
+                   << " ms";
+            if (pair.source_sequence_start.has_value() &&
+                pair.source_sequence_end.has_value()) {
+                status << " | source #"
+                       << *pair.source_sequence_start
+                       << "->#"
+                       << *pair.source_sequence_end;
+            }
             success_status = status.str();
         } catch (const cv::Exception& error) {
             sequence = FrameSequence{};
             sequence.frames.push_back(pair.second.clone());
+            sequence.frame_period =
+                CalculateInterpolatedFramePeriod(
+                    pair.source_interval, 1, 0);
+            sequence.delay_before_first_frame = true;
+            sequence.source_interval = pair.source_interval;
+            sequence.newest_source_arrival_time =
+                pair.newest_source_arrival_time;
+            sequence.source_sequence_start =
+                pair.source_sequence_start;
+            sequence.source_sequence_end =
+                pair.source_sequence_end;
             failure_message =
                 std::string("OpenCV DIS interpolation failed: ") +
                 error.what();
         } catch (const std::exception& error) {
             sequence = FrameSequence{};
             sequence.frames.push_back(pair.second.clone());
+            sequence.frame_period =
+                CalculateInterpolatedFramePeriod(
+                    pair.source_interval, 1, 0);
+            sequence.delay_before_first_frame = true;
+            sequence.source_interval = pair.source_interval;
+            sequence.newest_source_arrival_time =
+                pair.newest_source_arrival_time;
+            sequence.source_sequence_start =
+                pair.source_sequence_start;
+            sequence.source_sequence_end =
+                pair.source_sequence_end;
             failure_message =
                 std::string("frame interpolation failed: ") +
                 error.what();
@@ -451,6 +578,13 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
     if (config_.intermediate_frame_count == 0) {
         FrameSequence passthrough;
         passthrough.frames.push_back(pair.second.clone());
+        passthrough.source_interval = pair.source_interval;
+        passthrough.newest_source_arrival_time =
+            pair.newest_source_arrival_time;
+        passthrough.source_sequence_start =
+            pair.source_sequence_start;
+        passthrough.source_sequence_end =
+            pair.source_sequence_end;
         return passthrough;
     }
 
@@ -717,10 +851,17 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
     FrameSequence sequence;
     sequence.frames.reserve(interval_count);
     sequence.frame_period = CalculateInterpolatedFramePeriod(
-        pair.source_interval_sum,
-        pair.source_interval_count,
+        pair.source_interval,
+        1,
         config_.intermediate_frame_count);
     sequence.delay_before_first_frame = true;
+    sequence.source_interval = pair.source_interval;
+    sequence.newest_source_arrival_time =
+        pair.newest_source_arrival_time;
+    sequence.source_sequence_start =
+        pair.source_sequence_start;
+    sequence.source_sequence_end =
+        pair.source_sequence_end;
 
     for (std::size_t k = 1; k < interval_count; ++k) {
         const float alpha =
@@ -844,6 +985,8 @@ bool DisFrameInterpolator::PushReadySequence(
     }
 
     ready_sequences_.push_back(std::move(sequence));
+    maximum_ready_sequences_ = std::max(
+        maximum_ready_sequences_, ready_sequences_.size());
     return true;
 }
 

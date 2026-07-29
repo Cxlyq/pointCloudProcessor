@@ -13,8 +13,10 @@
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: false
     interpolation_flow_consistency_mask: false
-    interpolation_timing_source: "arrival"
-    interpolation_display_queue_depth: 10
+    interpolation_timing_source: "message_stamp"
+    interpolation_pending_pair_capacity: 3
+    interpolation_ready_sequence_capacity: 2
+    interpolation_highgui_event_mode: "poll_key"
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - DIS Quality x20"

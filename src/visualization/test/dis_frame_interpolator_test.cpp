@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -56,10 +57,10 @@ cv::Mat SolidFrame(
         cv::Scalar(value, value, value)).clone();
 }
 
-TEST(InterpolationTimingTest, CoalescingUsesAverageSourceInterval) {
+TEST(InterpolationTimingTest, AveragesAccumulatedSourceIntervals) {
     const auto normal_period = CalculateInterpolatedFramePeriod(
         std::chrono::seconds(2), 1, 4);
-    const auto coalesced_period = CalculateInterpolatedFramePeriod(
+    const auto averaged_period = CalculateInterpolatedFramePeriod(
         std::chrono::seconds(4), 2, 4);
 
     EXPECT_EQ(
@@ -68,7 +69,7 @@ TEST(InterpolationTimingTest, CoalescingUsesAverageSourceInterval) {
         400);
     EXPECT_EQ(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            coalesced_period).count(),
+            averaged_period).count(),
         400);
 }
 
@@ -198,7 +199,7 @@ TEST(DisFrameInterpolatorTest, ReadyQueueBackpressurePreservesSequences) {
     EXPECT_NEAR(cv::mean(second)[0], 20.0, 1.0);
     EXPECT_NEAR(cv::mean(third)[0], 30.0, 1.0);
     EXPECT_EQ(
-        interpolator.GetQueueStats().coalesced_source_frames,
+        interpolator.GetQueueStats().source_backpressure_waits,
         0U);
 }
 
@@ -211,14 +212,19 @@ TEST(DisFrameInterpolatorTest, LatePlaybackPresentsEveryFrameInOrder) {
 
     const auto first_arrival = std::chrono::steady_clock::now();
     interpolator.SubmitFrame(
-        SolidFrame(24, 24, 0), first_arrival);
+        SolidFrame(24, 24, 0),
+        first_arrival,
+        std::nullopt,
+        10);
 
     cv::Mat first;
     ASSERT_TRUE(WaitForDisplayFrame(interpolator, first));
 
     interpolator.SubmitFrame(
         SolidFrame(24, 24, 200),
-        first_arrival + 100ms);
+        first_arrival + 100ms,
+        std::nullopt,
+        11);
     ASSERT_TRUE(WaitUntil([&interpolator]() {
         const DisQueueStats stats = interpolator.GetQueueStats();
         return stats.ready_sequences == 1 && !stats.worker_busy;
@@ -242,6 +248,15 @@ TEST(DisFrameInterpolatorTest, LatePlaybackPresentsEveryFrameInOrder) {
     ASSERT_TRUE(interpolator.TryGetDisplayFrame(
         first_intermediate, &timing));
     EXPECT_TRUE(timing.starts_new_sequence);
+    EXPECT_EQ(timing.frame_index, 1U);
+    EXPECT_EQ(timing.frame_count, 5U);
+    ASSERT_TRUE(timing.source_sequence_start.has_value());
+    ASSERT_TRUE(timing.source_sequence_end.has_value());
+    EXPECT_EQ(*timing.source_sequence_start, 10U);
+    EXPECT_EQ(*timing.source_sequence_end, 11U);
+    EXPECT_TRUE(
+        timing.newest_source_arrival_time.has_value());
+    EXPECT_NEAR(timing.source_interval_ms, 100.0, 0.1);
     EXPECT_FALSE(first_intermediate.empty());
     EXPECT_EQ(first_intermediate.type(), CV_8UC3);
 
@@ -336,6 +351,54 @@ TEST(DisFrameInterpolatorTest, ReportsTimestampFallback) {
         std::string::npos);
 }
 
+TEST(DisFrameInterpolatorTest, ValidMessageTimestampsControlPlaybackPeriod) {
+    DisInterpolationConfig config;
+    config.intermediate_frame_count = 4;
+    config.flow_scale = 1.0;
+    config.dis_preset =
+        cv::DISOpticalFlow::PRESET_ULTRAFAST;
+    config.use_source_timestamps = true;
+    DisFrameInterpolator interpolator(config);
+
+    const auto first_arrival =
+        std::chrono::steady_clock::now();
+    interpolator.SubmitFrame(
+        SolidFrame(24, 24, 10),
+        first_arrival,
+        1s);
+    cv::Mat first;
+    ASSERT_TRUE(WaitForDisplayFrame(interpolator, first));
+
+    // Callback arrival is intentionally five seconds later, while the
+    // publisher timestamp advances only 100 ms. Playback must use the source
+    // timestamp so callback/DDS backpressure cannot stretch the frame period.
+    interpolator.SubmitFrame(
+        SolidFrame(24, 24, 20),
+        first_arrival + 5s,
+        1100ms);
+    ASSERT_TRUE(WaitUntil([&interpolator]() {
+        const DisQueueStats stats =
+            interpolator.GetQueueStats();
+        return stats.ready_sequences == 1 &&
+               !stats.worker_busy;
+    }));
+
+    cv::Mat activates_sequence;
+    EXPECT_FALSE(
+        interpolator.TryGetDisplayFrame(
+            activates_sequence));
+    cv::Mat intermediate;
+    DisDisplayTiming timing;
+    ASSERT_TRUE(WaitUntil(
+        [&interpolator, &intermediate, &timing]() {
+            return interpolator.TryGetDisplayFrame(
+                intermediate, &timing);
+        },
+        250ms));
+    EXPECT_NEAR(timing.source_interval_ms, 100.0, 0.1);
+    EXPECT_TRUE(interpolator.ConsumeError().empty());
+}
+
 TEST(DisFrameInterpolatorTest, SizeChangeResetsQueuedState) {
     DisInterpolationConfig config;
     config.intermediate_frame_count = 1;
@@ -421,7 +484,7 @@ TEST(DisFrameInterpolatorTest, QueueStatsExposeActiveTimelineLag) {
     EXPECT_GT(late_stats.playback_lag_ms, 0.0);
 }
 
-TEST(DisFrameInterpolatorTest, QueueStatsExposeDeterministicCoalescing) {
+TEST(DisFrameInterpolatorTest, PendingQueueBackpressurePreservesEveryPair) {
     DisInterpolationConfig config;
     config.intermediate_frame_count = 0;
     config.max_pending_pairs = 1;
@@ -436,7 +499,7 @@ TEST(DisFrameInterpolatorTest, QueueStatsExposeDeterministicCoalescing) {
         first_arrival + 20ms);
 
     // The first display frame fills the ready queue, so the worker is
-    // deterministically blocked while publishing the second frame.
+    // deterministically blocked while placing the second frame there.
     ASSERT_TRUE(WaitUntil([&interpolator]() {
         const DisQueueStats stats = interpolator.GetQueueStats();
         return stats.worker_busy &&
@@ -447,15 +510,110 @@ TEST(DisFrameInterpolatorTest, QueueStatsExposeDeterministicCoalescing) {
     interpolator.SubmitFrame(
         SolidFrame(16, 16, 30),
         first_arrival + 40ms);
-    interpolator.SubmitFrame(
-        SolidFrame(16, 16, 40),
-        first_arrival + 60ms);
+    auto fourth_submission = std::async(
+        std::launch::async,
+        [&interpolator, first_arrival]() {
+            interpolator.SubmitFrame(
+                SolidFrame(16, 16, 40),
+                first_arrival + 60ms);
+        });
+
+    const bool submission_blocked = WaitUntil([&interpolator]() {
+        const DisQueueStats stats = interpolator.GetQueueStats();
+        return stats.source_backpressure_active &&
+               stats.source_backpressure_waits == 1 &&
+               stats.pending_pairs == 1 &&
+               stats.ready_sequences == 1;
+    });
+
+    cv::Mat first;
+    cv::Mat second;
+    cv::Mat third;
+    cv::Mat fourth;
+    const bool got_first =
+        WaitForDisplayFrame(interpolator, first);
+    const bool submission_released =
+        fourth_submission.wait_for(3s) ==
+        std::future_status::ready;
+    if (submission_released) {
+        fourth_submission.get();
+    } else {
+        interpolator.RequestStop();
+        fourth_submission.wait();
+    }
+    const bool got_second =
+        WaitForDisplayFrame(interpolator, second);
+    const bool got_third =
+        WaitForDisplayFrame(interpolator, third);
+    const bool got_fourth =
+        WaitForDisplayFrame(interpolator, fourth);
+
+    ASSERT_TRUE(submission_blocked);
+    ASSERT_TRUE(submission_released);
+    ASSERT_TRUE(got_first);
+    ASSERT_TRUE(got_second);
+    ASSERT_TRUE(got_third);
+    ASSERT_TRUE(got_fourth);
+    EXPECT_NEAR(cv::mean(first)[0], 10.0, 1.0);
+    EXPECT_NEAR(cv::mean(second)[0], 20.0, 1.0);
+    EXPECT_NEAR(cv::mean(third)[0], 30.0, 1.0);
+    EXPECT_NEAR(cv::mean(fourth)[0], 40.0, 1.0);
 
     const DisQueueStats stats = interpolator.GetQueueStats();
-    EXPECT_TRUE(stats.worker_busy);
-    EXPECT_EQ(stats.pending_pairs, 1U);
-    EXPECT_EQ(stats.ready_sequences, 1U);
-    EXPECT_EQ(stats.coalesced_source_frames, 1U);
+    EXPECT_EQ(stats.source_backpressure_waits, 1U);
+    EXPECT_GT(stats.source_backpressure_wait_ms, 0.0);
+    EXPECT_GT(
+        stats.maximum_source_backpressure_wait_ms, 0.0);
+    EXPECT_FALSE(stats.source_backpressure_active);
+}
+
+TEST(DisFrameInterpolatorTest, RequestStopUnblocksPendingSourceSubmission) {
+    DisInterpolationConfig config;
+    config.intermediate_frame_count = 0;
+    config.max_pending_pairs = 1;
+    config.max_ready_sequences = 1;
+    DisFrameInterpolator interpolator(config);
+
+    const auto first_arrival = std::chrono::steady_clock::now();
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 10), first_arrival);
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 20),
+        first_arrival + 20ms);
+    ASSERT_TRUE(WaitUntil([&interpolator]() {
+        const DisQueueStats stats = interpolator.GetQueueStats();
+        return stats.worker_busy &&
+               stats.pending_pairs == 0 &&
+               stats.ready_sequences == 1;
+    }));
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 30),
+        first_arrival + 40ms);
+
+    auto blocked_submission = std::async(
+        std::launch::async,
+        [&interpolator, first_arrival]() {
+            interpolator.SubmitFrame(
+                SolidFrame(16, 16, 40),
+                first_arrival + 60ms);
+        });
+    const bool submission_blocked =
+        WaitUntil([&interpolator]() {
+            const DisQueueStats stats =
+                interpolator.GetQueueStats();
+            return stats.source_backpressure_active;
+        });
+
+    interpolator.RequestStop();
+    const bool submission_released =
+        blocked_submission.wait_for(3s) ==
+        std::future_status::ready;
+    EXPECT_TRUE(submission_blocked);
+    EXPECT_TRUE(submission_released);
+    if (!submission_released) {
+        blocked_submission.wait();
+    }
+    blocked_submission.get();
 }
 
 TEST(DisFrameInterpolatorTest, BidirectionalConsistencyPathBuildsSequence) {

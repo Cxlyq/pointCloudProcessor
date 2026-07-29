@@ -16,15 +16,15 @@ inline sensor_msgs::msg::Image BgrMatToImageMessage(
     const cv::Mat& bgr_frame) {
     if (bgr_frame.empty()) {
         throw std::invalid_argument(
-            "cannot publish an empty interpolated frame");
+            "cannot convert an empty BGR frame");
     }
     if (bgr_frame.type() != CV_8UC3) {
         throw std::invalid_argument(
-            "interpolated frame must use CV_8UC3 BGR format");
+            "BGR frame must use CV_8UC3 format");
     }
     if (bgr_frame.rows < 0 || bgr_frame.cols < 0) {
         throw std::invalid_argument(
-            "interpolated frame has invalid dimensions");
+            "BGR frame has invalid dimensions");
     }
 
     const auto width = static_cast<std::uint64_t>(bgr_frame.cols);
@@ -35,7 +35,7 @@ inline sensor_msgs::msg::Image BgrMatToImageMessage(
                 kBytesPerPixel ||
         height > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error(
-            "interpolated frame dimensions exceed sensor_msgs/Image");
+            "BGR frame dimensions exceed sensor_msgs/Image");
     }
 
     const std::uint64_t row_bytes = width * kBytesPerPixel;
@@ -43,7 +43,7 @@ inline sensor_msgs::msg::Image BgrMatToImageMessage(
         row_bytes >
             std::numeric_limits<std::size_t>::max() / height) {
         throw std::overflow_error(
-            "interpolated frame byte count exceeds addressable memory");
+            "BGR frame byte count exceeds addressable memory");
     }
 
     sensor_msgs::msg::Image message;
@@ -79,7 +79,7 @@ inline cv::Mat BgrImageMessageView(
     const sensor_msgs::msg::Image& message) {
     if (message.height == 0 || message.width == 0) {
         throw std::invalid_argument(
-            "received an empty interpolated image");
+            "received an empty BGR image");
     }
     if (message.height >
             static_cast<std::uint32_t>(
@@ -88,11 +88,11 @@ inline cv::Mat BgrImageMessageView(
             static_cast<std::uint32_t>(
                 std::numeric_limits<int>::max())) {
         throw std::overflow_error(
-            "interpolated image dimensions exceed OpenCV limits");
+            "BGR image dimensions exceed OpenCV limits");
     }
     if (message.encoding != sensor_msgs::image_encodings::BGR8) {
         throw std::invalid_argument(
-            "interpolated image encoding must be bgr8, got " +
+            "BGR image encoding must be bgr8, got " +
             message.encoding);
     }
 
@@ -101,14 +101,14 @@ inline cv::Mat BgrImageMessageView(
         static_cast<std::uint64_t>(message.width) * kBytesPerPixel;
     if (message.step < minimum_step) {
         throw std::invalid_argument(
-            "interpolated image row step is too small");
+            "BGR image row step is too small");
     }
     if (message.height > 0 &&
         message.step >
             std::numeric_limits<std::size_t>::max() /
                 message.height) {
         throw std::overflow_error(
-            "interpolated image byte count exceeds addressable memory");
+            "BGR image byte count exceeds addressable memory");
     }
 
     const std::size_t required_bytes =
@@ -116,7 +116,7 @@ inline cv::Mat BgrImageMessageView(
         static_cast<std::size_t>(message.height);
     if (message.data.size() < required_bytes) {
         throw std::invalid_argument(
-            "interpolated image data is shorter than height * step");
+            "BGR image data is shorter than height * step");
     }
 
     // OpenCV's const-input APIs still require a mutable pointer when creating

@@ -19,7 +19,6 @@ find_package(Open3D REQUIRED)
 
 add_executable(visualization_node
         src/visualization_node.cpp
-        src/dis_frame_interpolator.cpp
 )
 
 target_include_directories(visualization_node PUBLIC
@@ -45,6 +44,7 @@ ament_target_dependencies(
 
 add_executable(interpolation_display_node
         src/interpolation_display_node.cpp
+        src/dis_frame_interpolator.cpp
 )
 target_include_directories(interpolation_display_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

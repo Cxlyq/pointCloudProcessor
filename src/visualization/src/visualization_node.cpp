@@ -1,14 +1,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cctype>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
-#include <exception>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -19,7 +15,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "pc_msgs/msg/o3_d_mesh.hpp"
 #include "visualization/display_frame_sequence.hpp"
-#include "visualization/dis_frame_interpolator.hpp"
 #include "visualization/ros_image_conversion.hpp"
 
 // 引入 Open3D 核心与可视化头文件
@@ -27,35 +22,13 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/video/tracking.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
 using std::placeholders::_1;
 
 namespace {
 
-constexpr char kInterpolatedFrameTopic[] = "interpolated_frames";
-
-int parse_dis_preset(std::string preset) {
-    std::transform(
-        preset.begin(), preset.end(), preset.begin(),
-        [](unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        });
-
-    if (preset == "ultrafast") {
-        return cv::DISOpticalFlow::PRESET_ULTRAFAST;
-    }
-    if (preset == "fast") {
-        return cv::DISOpticalFlow::PRESET_FAST;
-    }
-    if (preset == "medium") {
-        return cv::DISOpticalFlow::PRESET_MEDIUM;
-    }
-
-    throw std::invalid_argument(
-        "interpolation_dis_preset must be ultrafast, fast, or medium");
-}
+constexpr char kSourceFrameTopic[] = "interpolation_source_frames";
 
 cv::Mat open3d_float_rgb_to_bgr8(open3d::geometry::Image& image) {
     if (image.width_ <= 0 || image.height_ <= 0) {
@@ -84,10 +57,14 @@ struct FpsWindow {
     bool initialized = false;
     std::chrono::steady_clock::time_point window_started_at;
     std::chrono::steady_clock::time_point last_frame_at;
-    std::size_t interval_count = 0;
     double maximum_gap_ms = 0.0;
-    std::size_t playback_interval_count = 0;
-    double playback_interval_sum_sec = 0.0;
+    std::size_t operation_count = 0;
+    double capture_sum_ms = 0.0;
+    double maximum_capture_ms = 0.0;
+    double encode_sum_ms = 0.0;
+    double maximum_encode_ms = 0.0;
+    double publish_sum_ms = 0.0;
+    double maximum_publish_ms = 0.0;
 };
 
 // 用于存储单一相机窗口的配置与实例状态
@@ -105,18 +82,13 @@ struct CamConfig {
     bool is_first_frame = true;
     std::shared_ptr<open3d::visualization::Visualizer> vis;
     std::shared_ptr<open3d::geometry::TriangleMesh> interpolation_render_mesh;
-    std::string interpolation_window_name;
-    std::unique_ptr<pointcloud_visualization::DisFrameInterpolator> interpolator;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr
-        interpolation_frame_publisher;
-    // source_fps and last_reported_superseded_mesh_count are main-thread-owned.
-    // interpolation_fps and its counter baselines are output-thread-owned
-    // after construction.
+        source_frame_publisher;
     FpsWindow source_fps;
-    FpsWindow interpolation_fps;
     std::uint64_t last_reported_superseded_mesh_count = 0;
-    std::uint64_t last_reported_coalesced_source_frames = 0;
-    std::uint64_t next_interpolated_frame_sequence = 1;
+    std::uint64_t next_source_frame_sequence = 1;
+    std::uint64_t total_source_frames_published = 0;
+    std::size_t last_source_subscriber_count = 0;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -128,20 +100,8 @@ public:
         this->declare_parameter<bool>("fps_logging_enabled", true);
         this->declare_parameter<double>("fps_logging_interval_sec", 5.0);
         this->declare_parameter<bool>("interpolation_enabled", false);
-        this->declare_parameter<int>("interpolation_intermediate_frames", 4);
-        this->declare_parameter<double>("interpolation_flow_scale", 0.25);
-        this->declare_parameter<std::string>("interpolation_dis_preset", "ultrafast");
-        this->declare_parameter<bool>("interpolation_bidirectional_flow", false);
-        this->declare_parameter<bool>(
-            "interpolation_flow_consistency_mask", false);
-        this->declare_parameter<std::string>(
-            "interpolation_timing_source", "arrival");
-        this->declare_parameter<std::int64_t>(
-            "interpolation_display_queue_depth", 10);
         this->declare_parameter<bool>("interpolation_lock_camera", false);
         this->declare_parameter<bool>("interpolation_show_source_window", false);
-        this->declare_parameter<std::string>(
-            "interpolation_window_suffix", " - DIS Interpolated");
 
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto camera_ids = this->get_parameter("camera_ids").as_string_array();
@@ -163,87 +123,16 @@ public:
             this->get_parameter("fps_logging_interval_sec").as_double();
         interpolation_enabled_ =
             this->get_parameter("interpolation_enabled").as_bool();
-        interpolation_intermediate_frames_ =
-            this->get_parameter(
-                "interpolation_intermediate_frames").as_int();
-        interpolation_flow_scale_ =
-            this->get_parameter("interpolation_flow_scale").as_double();
-        interpolation_dis_preset_name_ =
-            this->get_parameter("interpolation_dis_preset").as_string();
-        interpolation_bidirectional_flow_ =
-            this->get_parameter("interpolation_bidirectional_flow").as_bool();
-        interpolation_flow_consistency_mask_ =
-            this->get_parameter(
-                "interpolation_flow_consistency_mask").as_bool();
-        interpolation_timing_source_ =
-            this->get_parameter(
-                "interpolation_timing_source").as_string();
-        interpolation_display_queue_depth_ =
-            this->get_parameter(
-                "interpolation_display_queue_depth").as_int();
         interpolation_lock_camera_ =
             this->get_parameter("interpolation_lock_camera").as_bool();
         interpolation_show_source_window_ =
             this->get_parameter("interpolation_show_source_window").as_bool();
-        interpolation_window_suffix_ =
-            this->get_parameter("interpolation_window_suffix").as_string();
 
         if (fps_logging_enabled_ &&
             (!std::isfinite(fps_logging_interval_sec_) ||
              fps_logging_interval_sec_ <= 0.0)) {
             throw std::invalid_argument(
                 "fps_logging_interval_sec must be greater than zero");
-        }
-
-        if (interpolation_enabled_) {
-            if (interpolation_intermediate_frames_ < 0) {
-                throw std::invalid_argument(
-                    "interpolation_intermediate_frames must be "
-                    "greater than or equal to zero");
-            }
-            if (interpolation_intermediate_frames_ > 120) {
-                throw std::invalid_argument(
-                    "interpolation_intermediate_frames must not "
-                    "exceed 120");
-            }
-            if (!std::isfinite(interpolation_flow_scale_) ||
-                interpolation_flow_scale_ <= 0.0 ||
-                interpolation_flow_scale_ > 1.0) {
-                throw std::invalid_argument(
-                    "interpolation_flow_scale must be in (0, 1]");
-            }
-            if (interpolation_flow_consistency_mask_ &&
-                !interpolation_bidirectional_flow_) {
-                throw std::invalid_argument(
-                    "interpolation_flow_consistency_mask requires "
-                    "interpolation_bidirectional_flow");
-            }
-            if (interpolation_display_queue_depth_ <= 0 ||
-                interpolation_display_queue_depth_ > 1000) {
-                throw std::invalid_argument(
-                    "interpolation_display_queue_depth must be "
-                    "in [1, 1000]");
-            }
-            interpolation_dis_preset_ =
-                parse_dis_preset(interpolation_dis_preset_name_);
-            std::transform(
-                interpolation_timing_source_.begin(),
-                interpolation_timing_source_.end(),
-                interpolation_timing_source_.begin(),
-                [](unsigned char character) {
-                    return static_cast<char>(
-                        std::tolower(character));
-                });
-            if (interpolation_timing_source_ == "arrival") {
-                interpolation_use_message_timestamps_ = false;
-            } else if (
-                interpolation_timing_source_ == "message_stamp") {
-                interpolation_use_message_timestamps_ = true;
-            } else {
-                throw std::invalid_argument(
-                    "interpolation_timing_source must be arrival "
-                    "or message_stamp");
-            }
         }
 
         // 2. 遍历参数，动态加载所有视角的窗口配置
@@ -356,38 +245,12 @@ public:
             opt.mesh_color_option_ = open3d::visualization::RenderOption::MeshColorOption::Color;
 
             if (interpolation_enabled_) {
-                pointcloud_visualization::DisInterpolationConfig interpolation_config;
-                interpolation_config.intermediate_frame_count =
-                    static_cast<std::size_t>(
-                        interpolation_intermediate_frames_);
-                interpolation_config.flow_scale = interpolation_flow_scale_;
-                interpolation_config.dis_preset = interpolation_dis_preset_;
-                interpolation_config.use_bidirectional_flow =
-                    interpolation_bidirectional_flow_;
-                interpolation_config.use_flow_consistency_mask =
-                    interpolation_flow_consistency_mask_;
-                interpolation_config.use_source_timestamps =
-                    interpolation_use_message_timestamps_;
-                interpolation_config.border_color_bgr = cv::Scalar(
-                    cfg.bg_color.z() * 255.0,
-                    cfg.bg_color.y() * 255.0,
-                    cfg.bg_color.x() * 255.0);
-
-                cfg.interpolation_window_name =
-                    cfg.name + interpolation_window_suffix_;
-                cfg.interpolator =
-                    std::make_unique<
-                        pointcloud_visualization::DisFrameInterpolator>(
-                        interpolation_config,
-                        [this]() {
-                            NotifyPresentationThread();
-                        });
                 rclcpp::QoS image_qos{rclcpp::KeepAll()};
                 image_qos.reliable();
-                cfg.interpolation_frame_publisher =
+                cfg.source_frame_publisher =
                     this->create_publisher<
                         sensor_msgs::msg::Image>(
-                        std::string(kInterpolatedFrameTopic) +
+                        std::string(kSourceFrameTopic) +
                             "/" + cam_id,
                         image_qos);
             }
@@ -415,45 +278,15 @@ public:
         if (interpolation_enabled_) {
             RCLCPP_INFO(
                 this->get_logger(),
-                "[*] %s DIS interpolation enabled: %d intermediate "
-                "frames per real-frame pair (approximately %dx source "
-                "frame count), scale %.2f, preset %s.",
-                interpolation_bidirectional_flow_ ?
-                    "Bidirectional" : "Single-direction",
-                interpolation_intermediate_frames_,
-                interpolation_intermediate_frames_ + 1,
-                interpolation_flow_scale_,
-                interpolation_dis_preset_name_.c_str());
-            RCLCPP_INFO(
-                this->get_logger(),
-                "[*] Interpolation timing source: %s.",
-                interpolation_timing_source_.c_str());
-            RCLCPP_INFO(
-                this->get_logger(),
-                "[*] Interpolated frames are deadline-scheduled on a "
-                "worker and published with reliable KeepAll QoS to "
-                "\"%s/<camera_id>\". The display FIFO depth is %lld; "
-                "playback never skips an already generated frame.",
-                kInterpolatedFrameTopic,
-                static_cast<long long>(
-                    interpolation_display_queue_depth_));
-            RCLCPP_INFO(
-                this->get_logger(),
-                "[*] Bidirectional flow consistency masking is %s.",
-                interpolation_flow_consistency_mask_ ?
-                    "enabled" : "disabled");
+                "[*] Visualization publishes only real rendered frames "
+                "with reliable KeepAll QoS to \"%s/<camera_id>\". DIS "
+                "generation and playback are owned by the display process.",
+                kSourceFrameTopic);
             RCLCPP_DEBUG(
                 this->get_logger(),
                 "[*] Source render window is %s; only the interpolated "
                 "window is intended for normal viewing.",
                 interpolation_show_source_window_ ? "visible" : "hidden");
-        }
-
-        // Start only after every publisher and interpolator has been created.
-        // GUI ownership lives in the separate interpolation_display_node
-        // process, so this helper performs no HighGUI calls.
-        if (interpolation_enabled_) {
-            StartPresentationThread();
         }
     }
 
@@ -464,18 +297,12 @@ public:
     // 维持 UI 心跳的主循环函数
     void update_ui() {
         std::shared_ptr<open3d::geometry::TriangleMesh> mesh_to_render = nullptr;
-        std::chrono::steady_clock::time_point mesh_received_at;
-        std::optional<std::chrono::nanoseconds>
-            mesh_source_timestamp;
 
         // 从交换区安全地取出新数据
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (new_mesh_available_) {
                 mesh_to_render = latest_mesh_;
-                mesh_received_at = latest_mesh_received_at_;
-                mesh_source_timestamp =
-                    latest_mesh_source_timestamp_;
                 new_mesh_available_ = false;
             }
         }
@@ -546,7 +373,8 @@ public:
                 item.vis->PollEvents();
             }
 
-            if (mesh_to_render != nullptr && item.interpolator != nullptr) {
+            if (mesh_to_render != nullptr &&
+                item.source_frame_publisher != nullptr) {
                 try {
                     auto captured_image =
                         item.vis->CaptureScreenFloatBuffer(true);
@@ -574,16 +402,12 @@ public:
                             "Open3D captured only the background; "
                             "the source mesh was not rendered");
                     }
-                    item.interpolator->SubmitFrame(
-                        rendered_frame,
-                        mesh_received_at,
-                        mesh_source_timestamp);
-                    RecordSourceFrame(
-                        item, std::chrono::steady_clock::now());
                     const double capture_ms =
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() -
                             source_processing_started_at).count();
+                    PublishSourceFrame(
+                        item, rendered_frame, capture_ms);
                     RCLCPP_DEBUG(
                         this->get_logger(),
                         "[*] Source mesh update, render, and capture "
@@ -592,7 +416,7 @@ public:
                 } catch (const std::exception& error) {
                     RCLCPP_ERROR(
                         this->get_logger(),
-                        "[!] Failed to capture rendered frame for interpolation: %s",
+                        "[!] Failed to publish rendered source frame: %s",
                         error.what());
                 }
             }
@@ -603,23 +427,6 @@ public:
                     error.what());
             }
 
-            if (item.interpolator != nullptr) {
-                const std::string interpolation_status =
-                    item.interpolator->ConsumeStatus();
-                if (!interpolation_status.empty()) {
-                    RCLCPP_INFO(
-                        this->get_logger(), "[GEN] %s",
-                        interpolation_status.c_str());
-                }
-
-                const std::string interpolation_error =
-                    item.interpolator->ConsumeError();
-                if (!interpolation_error.empty()) {
-                    RCLCPP_WARN(
-                        this->get_logger(), "[?] %s",
-                        interpolation_error.c_str());
-                }
-            }
         }
 
     }
@@ -629,10 +436,8 @@ public:
             return;
         }
         cleanup_completed_ = true;
-        StopPresentationThread();
         for (auto& item : visualizers_) {
-            item.interpolator.reset();
-            item.interpolation_frame_publisher.reset();
+            item.source_frame_publisher.reset();
             if (item.vis != nullptr) {
                 item.vis->DestroyVisualizerWindow();
             }
@@ -640,175 +445,47 @@ public:
     }
 
 private:
-    void StartPresentationThread() {
-        {
-            std::lock_guard<std::mutex> lock(presentation_mutex_);
-            presentation_stopping_ = false;
-        }
-
-        presentation_thread_ =
-            std::thread(&VisualizationNode::PresentationLoop, this);
-    }
-
-    void StopPresentationThread() {
-        {
-            std::lock_guard<std::mutex> lock(presentation_mutex_);
-            presentation_stopping_ = true;
-        }
-        presentation_condition_.notify_all();
-        if (presentation_thread_.joinable()) {
-            presentation_thread_.join();
-        }
-    }
-
-    void NotifyPresentationThread() {
-        {
-            std::lock_guard<std::mutex> lock(
-                presentation_mutex_);
-            ++presentation_wakeup_generation_;
-        }
-        presentation_condition_.notify_one();
-    }
-
-    void PresentationLoop() {
-        try {
-            while (true) {
-                std::uint64_t observed_wakeup_generation = 0;
-                {
-                    std::lock_guard<std::mutex> lock(
-                        presentation_mutex_);
-                    if (presentation_stopping_) {
-                        break;
-                    }
-                    observed_wakeup_generation =
-                        presentation_wakeup_generation_;
-                }
-
-                for (auto& item : visualizers_) {
-                    if (HasDisplaySubscriber(item)) {
-                        PublishReadyInterpolatedFrame(item);
-                    }
-                }
-
-                const auto now =
-                    std::chrono::steady_clock::now();
-                std::optional<
-                    std::chrono::steady_clock::time_point> wake_at;
-                bool needs_subscription_poll = false;
-                for (const auto& item : visualizers_) {
-                    if (!HasDisplaySubscriber(item)) {
-                        // DDS discovery does not use the interpolator's ready
-                        // callback, so check again after a short bounded wait.
-                        needs_subscription_poll = true;
-                        continue;
-                    }
-                    const auto deadline =
-                        item.interpolator->
-                            GetNextDisplayDeadline();
-                    if (deadline.has_value() &&
-                        (!wake_at.has_value() ||
-                         *deadline < *wake_at)) {
-                        wake_at = *deadline;
-                    }
-                }
-                if (needs_subscription_poll) {
-                    const auto subscription_poll_at =
-                        now + std::chrono::milliseconds(10);
-                    if (!wake_at.has_value() ||
-                        subscription_poll_at < *wake_at) {
-                        wake_at = subscription_poll_at;
-                    }
-                }
-
-                std::unique_lock<std::mutex> lock(
-                    presentation_mutex_);
-                if (presentation_stopping_) {
-                    break;
-                }
-                const auto was_notified =
-                    [this, observed_wakeup_generation]() {
-                        return presentation_stopping_ ||
-                               presentation_wakeup_generation_ !=
-                                   observed_wakeup_generation;
-                    };
-                // A notification is emitted after a complete sequence has
-                // entered ready_sequences_. It shortens either wait without
-                // changing sequence ownership or playback order.
-                if (wake_at.has_value()) {
-                    if (*wake_at >
-                        std::chrono::steady_clock::now()) {
-                        presentation_condition_.wait_until(
-                            lock,
-                            *wake_at,
-                            was_notified);
-                    }
-                } else {
-                    presentation_condition_.wait(
-                        lock, was_notified);
-                }
-            }
-        } catch (...) {
-            const std::exception_ptr failure =
-                std::current_exception();
-            {
-                std::lock_guard<std::mutex> lock(
-                    presentation_mutex_);
-                presentation_stopping_ = true;
-            }
-            presentation_condition_.notify_all();
-
-            try {
-                std::rethrow_exception(failure);
-            } catch (const std::exception& error) {
-                RCLCPP_ERROR(
-                    this->get_logger(),
-                    "[!] Interpolation output thread failed: %s",
-                    error.what());
-            } catch (...) {
-                RCLCPP_ERROR(
-                    this->get_logger(),
-                    "[!] Interpolation output thread failed with an "
-                    "unknown exception.");
-            }
-            if (rclcpp::ok()) {
-                rclcpp::shutdown();
-            }
-        }
-    }
-
-    bool HasDisplaySubscriber(
-        const CamConfig& item) const {
-        return item.interpolator != nullptr &&
-               item.interpolation_frame_publisher != nullptr &&
-               item.interpolation_frame_publisher->
-                   get_subscription_count() > 0;
-    }
-
-    void PublishReadyInterpolatedFrame(CamConfig& item) {
-        if (!HasDisplaySubscriber(item)) {
-            return;
-        }
-
-        cv::Mat interpolated_frame;
-        pointcloud_visualization::DisDisplayTiming timing;
-        if (!item.interpolator->TryGetDisplayFrame(
-                interpolated_frame, &timing)) {
-            return;
-        }
-
+    void PublishSourceFrame(
+        CamConfig& item,
+        const cv::Mat& source_frame,
+        double capture_ms) {
+        const auto encode_started_at =
+            std::chrono::steady_clock::now();
         sensor_msgs::msg::Image message =
             pointcloud_visualization::BgrMatToImageMessage(
-                interpolated_frame);
+                source_frame);
+        const auto encode_finished_at =
+            std::chrono::steady_clock::now();
         message.header.stamp = this->get_clock()->now();
         message.header.frame_id =
             pointcloud_visualization::EncodeDisplayFrameSequence(
-                item.next_interpolated_frame_sequence++);
-        item.interpolation_frame_publisher->publish(message);
+                item.next_source_frame_sequence++);
 
-        RecordInterpolatedFrame(
+        const std::size_t subscriber_count =
+            item.source_frame_publisher->get_subscription_count();
+        const auto publish_started_at =
+            std::chrono::steady_clock::now();
+        item.source_frame_publisher->publish(message);
+        const auto published_at =
+            std::chrono::steady_clock::now();
+        ++item.total_source_frames_published;
+        item.last_source_subscriber_count =
+            subscriber_count;
+
+        const double encode_ms =
+            std::chrono::duration<double, std::milli>(
+                encode_finished_at -
+                encode_started_at).count();
+        const double publish_ms =
+            std::chrono::duration<double, std::milli>(
+                published_at -
+                publish_started_at).count();
+        RecordSourceFrame(
             item,
-            std::chrono::steady_clock::now(),
-            timing.starts_new_sequence);
+            published_at,
+            capture_ms,
+            encode_ms,
+            publish_ms);
     }
 
     void InitializeFpsWindow(
@@ -817,15 +494,22 @@ private:
         window.initialized = true;
         window.window_started_at = now;
         window.last_frame_at = now;
-        window.interval_count = 0;
         window.maximum_gap_ms = 0.0;
-        window.playback_interval_count = 0;
-        window.playback_interval_sum_sec = 0.0;
+        window.operation_count = 0;
+        window.capture_sum_ms = 0.0;
+        window.maximum_capture_ms = 0.0;
+        window.encode_sum_ms = 0.0;
+        window.maximum_encode_ms = 0.0;
+        window.publish_sum_ms = 0.0;
+        window.maximum_publish_ms = 0.0;
     }
 
     void RecordSourceFrame(
         CamConfig& item,
-        std::chrono::steady_clock::time_point now) {
+        std::chrono::steady_clock::time_point now,
+        double capture_ms = 0.0,
+        double encode_ms = 0.0,
+        double publish_ms = 0.0) {
         if (!fps_logging_enabled_) {
             return;
         }
@@ -835,15 +519,26 @@ private:
             item.last_reported_superseded_mesh_count =
                 superseded_mesh_count_.load();
             InitializeFpsWindow(window, now);
-            return;
+        } else {
+            const double gap_sec =
+                std::chrono::duration<double>(
+                    now - window.last_frame_at).count();
+            window.last_frame_at = now;
+            window.maximum_gap_ms =
+                std::max(
+                    window.maximum_gap_ms,
+                    gap_sec * 1000.0);
         }
-
-        const double gap_sec = std::chrono::duration<double>(
-            now - window.last_frame_at).count();
-        window.last_frame_at = now;
-        ++window.interval_count;
-        window.maximum_gap_ms =
-            std::max(window.maximum_gap_ms, gap_sec * 1000.0);
+        ++window.operation_count;
+        window.capture_sum_ms += capture_ms;
+        window.maximum_capture_ms = std::max(
+            window.maximum_capture_ms, capture_ms);
+        window.encode_sum_ms += encode_ms;
+        window.maximum_encode_ms = std::max(
+            window.maximum_encode_ms, encode_ms);
+        window.publish_sum_ms += publish_ms;
+        window.maximum_publish_ms = std::max(
+            window.maximum_publish_ms, publish_ms);
 
         const double elapsed_sec = std::chrono::duration<double>(
             now - window.window_started_at).count();
@@ -852,7 +547,8 @@ private:
         }
 
         const double measured_fps =
-            static_cast<double>(window.interval_count) / elapsed_sec;
+            static_cast<double>(window.operation_count) /
+            elapsed_sec;
         const std::uint64_t superseded_mesh_total =
             superseded_mesh_count_.load();
         const std::uint64_t superseded_mesh_delta =
@@ -863,13 +559,33 @@ private:
         if (interpolation_enabled_) {
             RCLCPP_INFO(
                 this->get_logger(),
-                "[SRC] Rendered \"%s\": %.2f FPS | %.1f s window | "
-                "max gap %.0f ms | superseded meshes +%llu "
+                "[SRC-TX] \"%s\": published %.2f FPS "
+                "(+%zu, total %llu) | %.1f s window | "
+                "max source gap %.0f ms | render/capture avg/max "
+                "%.1f/%.1f ms | image encode avg/max %.1f/%.1f ms | "
+                "DDS publish-call avg/max %.1f/%.1f ms | "
+                "last source #%llu | subscribers %zu | "
+                "superseded meshes +%llu "
                 "(total %llu).",
                 item.name.c_str(),
                 measured_fps,
+                window.operation_count,
+                static_cast<unsigned long long>(
+                    item.total_source_frames_published),
                 elapsed_sec,
                 window.maximum_gap_ms,
+                window.capture_sum_ms /
+                    static_cast<double>(window.operation_count),
+                window.maximum_capture_ms,
+                window.encode_sum_ms /
+                    static_cast<double>(window.operation_count),
+                window.maximum_encode_ms,
+                window.publish_sum_ms /
+                    static_cast<double>(window.operation_count),
+                window.maximum_publish_ms,
+                static_cast<unsigned long long>(
+                    item.next_source_frame_sequence - 1),
+                item.last_source_subscriber_count,
                 static_cast<unsigned long long>(
                     superseded_mesh_delta),
                 static_cast<unsigned long long>(
@@ -879,8 +595,8 @@ private:
                 this->get_logger(),
                 "[FPS] Display \"%s\" (no interpolation): "
                 "presented %.2f FPS | %.1f s window | "
-                "max display gap %.0f ms | superseded meshes +%llu "
-                "(total %llu).",
+                "max Open3D display-boundary gap %.0f ms | "
+                "superseded meshes +%llu (total %llu).",
                 item.name.c_str(),
                 measured_fps,
                 elapsed_sec,
@@ -894,85 +610,7 @@ private:
         InitializeFpsWindow(window, now);
     }
 
-    void RecordInterpolatedFrame(
-        CamConfig& item,
-        std::chrono::steady_clock::time_point now,
-        bool starts_new_sequence) {
-        if (!fps_logging_enabled_) {
-            return;
-        }
-
-        FpsWindow& window = item.interpolation_fps;
-        if (!window.initialized) {
-            const auto queue_stats =
-                item.interpolator->GetQueueStats();
-            item.last_reported_coalesced_source_frames =
-                queue_stats.coalesced_source_frames;
-            InitializeFpsWindow(window, now);
-            return;
-        }
-
-        const double gap_sec = std::chrono::duration<double>(
-            now - window.last_frame_at).count();
-        window.last_frame_at = now;
-        ++window.interval_count;
-        window.maximum_gap_ms =
-            std::max(window.maximum_gap_ms, gap_sec * 1000.0);
-        if (!starts_new_sequence) {
-            ++window.playback_interval_count;
-            window.playback_interval_sum_sec += gap_sec;
-        }
-
-        const double elapsed_sec = std::chrono::duration<double>(
-            now - window.window_started_at).count();
-        if (elapsed_sec < fps_logging_interval_sec_) {
-            return;
-        }
-
-        const double effective_fps =
-            static_cast<double>(window.interval_count) / elapsed_sec;
-        const double playback_fps =
-            window.playback_interval_count > 0 &&
-                    window.playback_interval_sum_sec > 0.0 ?
-                static_cast<double>(
-                    window.playback_interval_count) /
-                    window.playback_interval_sum_sec :
-                effective_fps;
-        const auto queue_stats =
-            item.interpolator->GetQueueStats();
-        const std::uint64_t coalesced_source_frame_delta =
-            queue_stats.coalesced_source_frames -
-            item.last_reported_coalesced_source_frames;
-        item.last_reported_coalesced_source_frames =
-            queue_stats.coalesced_source_frames;
-        RCLCPP_INFO(
-            this->get_logger(),
-            "[TX] Interpolated \"%s\": published playback %.1f FPS | "
-            "published effective %.1f FPS | %.1f s window | "
-            "max publish gap %.0f ms | "
-            "coalesced +%llu (total %llu) | queue %zu pending / "
-            "%zu ready / %zu active | worker %s | lag %.1f ms.",
-            item.interpolation_window_name.c_str(),
-            playback_fps,
-            effective_fps,
-            elapsed_sec,
-            window.maximum_gap_ms,
-            static_cast<unsigned long long>(
-                coalesced_source_frame_delta),
-            static_cast<unsigned long long>(
-                queue_stats.coalesced_source_frames),
-            queue_stats.pending_pairs,
-            queue_stats.ready_sequences,
-            queue_stats.active_frames_remaining,
-            queue_stats.worker_busy ? "busy" : "idle",
-            queue_stats.playback_lag_ms);
-
-        InitializeFpsWindow(window, now);
-    }
-
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
-        const auto mesh_received_at =
-            std::chrono::steady_clock::now();
         if (msg->vertices.empty() ||
             msg->vertices.size() % 3 != 0) {
             RCLCPP_WARN(
@@ -1000,17 +638,6 @@ private:
             return;
         }
 
-        std::optional<std::chrono::nanoseconds>
-            mesh_source_timestamp;
-        if (msg->header.stamp.sec != 0 ||
-            msg->header.stamp.nanosec != 0U) {
-            mesh_source_timestamp =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::seconds(
-                        msg->header.stamp.sec) +
-                    std::chrono::nanoseconds(
-                        msg->header.stamp.nanosec));
-        }
         auto mesh = std::make_shared<open3d::geometry::TriangleMesh>();
 
         // 1. 反序列化：还原顶点
@@ -1093,45 +720,20 @@ private:
                 ++superseded_mesh_count_;
             }
             latest_mesh_ = mesh;
-            latest_mesh_received_at_ = mesh_received_at;
-            latest_mesh_source_timestamp_ =
-                mesh_source_timestamp;
             new_mesh_available_ = true;
         }
     }
 
-    // These synchronization objects are declared before visualizers_ so they
-    // remain alive while interpolator callbacks are being destroyed during
-    // constructor unwinding as well as normal cleanup.
-    std::thread presentation_thread_;
-    std::mutex presentation_mutex_;
-    std::condition_variable presentation_condition_;
-    bool presentation_stopping_ = false;
-    std::uint64_t presentation_wakeup_generation_ = 0;
     bool cleanup_completed_ = false;
     std::vector<CamConfig> visualizers_;
     bool fps_logging_enabled_ = true;
     double fps_logging_interval_sec_ = 5.0;
     bool interpolation_enabled_ = false;
-    int interpolation_intermediate_frames_ = 4;
-    double interpolation_flow_scale_ = 0.25;
-    int interpolation_dis_preset_ =
-        cv::DISOpticalFlow::PRESET_ULTRAFAST;
-    std::string interpolation_dis_preset_name_ = "ultrafast";
-    bool interpolation_bidirectional_flow_ = false;
-    bool interpolation_flow_consistency_mask_ = false;
-    std::string interpolation_timing_source_ = "arrival";
-    bool interpolation_use_message_timestamps_ = false;
-    std::int64_t interpolation_display_queue_depth_ = 10;
     bool interpolation_lock_camera_ = false;
     bool interpolation_show_source_window_ = false;
-    std::string interpolation_window_suffix_ = " - DIS Interpolated";
     // 线程同步
     std::mutex mutex_;
     std::shared_ptr<open3d::geometry::TriangleMesh> latest_mesh_;
-    std::chrono::steady_clock::time_point latest_mesh_received_at_;
-    std::optional<std::chrono::nanoseconds>
-        latest_mesh_source_timestamp_;
     std::atomic<std::uint64_t> superseded_mesh_count_{0};
     bool new_mesh_available_;
 

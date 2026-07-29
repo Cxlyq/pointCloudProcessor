@@ -12,9 +12,15 @@
     interpolation_bidirectional_flow: true
     # Existing bidirectional quality setting; this patch does not change it.
     interpolation_flow_consistency_mask: true
-    interpolation_timing_source: "arrival"
-    # Application FIFO depth; reliable KeepAll DDS carries backpressure.
-    interpolation_display_queue_depth: 10
+    # visualization_node stamps every published source frame, so playback
+    # cadence remains correct even when DDS or application backpressure grows.
+    interpolation_timing_source: "message_stamp"
+    # Bounded, strictly ordered local queues. When they fill, source reception
+    # blocks and latency grows; no source pair or generated frame is dropped.
+    interpolation_pending_pair_capacity: 3
+    interpolation_ready_sequence_capacity: 2
+    # Keep every HighGUI call on the display main thread and measure it.
+    interpolation_highgui_event_mode: "poll_key"
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - Bidirectional DIS x5"
