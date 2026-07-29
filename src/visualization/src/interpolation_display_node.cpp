@@ -2,12 +2,16 @@
 #include "visualization/ros_image_conversion.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,6 +28,7 @@ namespace {
 
 constexpr char kInterpolatedFrameTopic[] = "interpolated_frames";
 constexpr auto kNoWindowPollInterval = std::chrono::milliseconds(5);
+constexpr std::int64_t kMaximumDisplayQueueDepth = 1000;
 
 struct DisplayStats {
     bool window_initialized = false;
@@ -32,19 +37,20 @@ struct DisplayStats {
     std::chrono::steady_clock::time_point last_presented_at;
     std::uint64_t window_received_frames = 0;
     std::uint64_t window_presented_frames = 0;
-    std::uint64_t window_overwritten_frames = 0;
+    std::uint64_t window_backpressure_waits = 0;
     std::uint64_t window_missing_frames = 0;
     std::uint64_t window_out_of_order_frames = 0;
     std::uint64_t window_unsequenced_frames = 0;
     std::uint64_t window_rejected_frames = 0;
     std::uint64_t total_received_frames = 0;
     std::uint64_t total_presented_frames = 0;
-    std::uint64_t total_overwritten_frames = 0;
+    std::uint64_t total_backpressure_waits = 0;
     std::uint64_t total_missing_frames = 0;
     std::uint64_t total_out_of_order_frames = 0;
     std::uint64_t total_unsequenced_frames = 0;
     std::uint64_t total_rejected_frames = 0;
     std::optional<std::uint64_t> last_received_sequence;
+    std::size_t maximum_queue_depth = 0;
     double maximum_display_gap_ms = 0.0;
     double maximum_imshow_ms = 0.0;
     double maximum_wait_key_ms = 0.0;
@@ -53,7 +59,7 @@ struct DisplayStats {
 struct WindowState {
     std::string camera_id;
     std::string window_name;
-    sensor_msgs::msg::Image::ConstSharedPtr pending_frame;
+    std::deque<sensor_msgs::msg::Image::ConstSharedPtr> pending_frames;
     sensor_msgs::msg::Image::ConstSharedPtr displayed_frame;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr
         subscription;
@@ -83,12 +89,23 @@ public:
         fps_logging_interval_sec_ =
             this->declare_parameter<double>(
                 "fps_logging_interval_sec", 5.0);
+        const std::int64_t configured_queue_depth =
+            this->declare_parameter<std::int64_t>(
+                "interpolation_display_queue_depth", 10);
         if (fps_logging_enabled_ &&
             (!std::isfinite(fps_logging_interval_sec_) ||
              fps_logging_interval_sec_ <= 0.0)) {
             throw std::invalid_argument(
                 "fps_logging_interval_sec must be greater than zero");
         }
+        if (configured_queue_depth <= 0 ||
+            configured_queue_depth >
+                kMaximumDisplayQueueDepth) {
+            throw std::invalid_argument(
+                "interpolation_display_queue_depth must be in [1, 1000]");
+        }
+        display_queue_depth_ =
+            static_cast<std::size_t>(configured_queue_depth);
 
         windows_.reserve(camera_ids.size());
         std::unordered_set<std::string> unique_camera_ids;
@@ -121,8 +138,8 @@ public:
             windows_.push_back(std::move(state));
         }
 
-        rclcpp::QoS image_qos(rclcpp::KeepLast(1));
-        image_qos.best_effort();
+        rclcpp::QoS image_qos(rclcpp::KeepAll());
+        image_qos.reliable();
         for (std::size_t index = 0;
              index < windows_.size();
              ++index) {
@@ -140,20 +157,17 @@ public:
                         if (message == nullptr) {
                             return;
                         }
-                        WindowState& state = windows_.at(index);
-                        RecordReceivedFrame(
-                            state,
-                            *message,
-                            std::chrono::steady_clock::now());
-                        state.pending_frame = std::move(message);
+                        EnqueueReceivedFrame(
+                            index, std::move(message));
                     });
 
             RCLCPP_INFO(
                 this->get_logger(),
                 "[*] Interpolation display \"%s\" is listening on "
-                "\"%s\".",
+                "\"%s\" with reliable KeepAll QoS and FIFO depth %zu.",
                 state.window_name.c_str(),
-                input_topic.c_str());
+                input_topic.c_str(),
+                display_queue_depth_);
         }
         RCLCPP_INFO(
             this->get_logger(),
@@ -168,21 +182,34 @@ public:
     }
 
     ~InterpolationDisplayNode() override {
+        RequestStop();
         DestroyWindows();
+    }
+
+    void RequestStop() noexcept {
+        stopping_.store(true);
+        queue_not_empty_condition_.notify_all();
+        queue_not_full_condition_.notify_all();
+    }
+
+    bool StopRequested() const noexcept {
+        return stopping_.load();
     }
 
     bool PresentReadyFramesAndProcessEvents() {
         bool has_created_window = false;
+        bool submitted_frame = false;
         for (auto& state : windows_) {
             state.submitted_this_cycle = false;
-            if (state.pending_frame == nullptr) {
+            auto next_frame = TryTakeNextFrame(state);
+            if (next_frame == nullptr) {
                 has_created_window =
                     has_created_window || state.created;
                 continue;
             }
 
             state.displayed_frame =
-                std::move(state.pending_frame);
+                std::move(next_frame);
             try {
                 const cv::Mat frame =
                     pointcloud_visualization::
@@ -199,18 +226,20 @@ public:
                         state.window_name,
                         frame.cols,
                         frame.rows);
+                    StartHighGuiEventThreadIfSupported();
                 }
                 const auto imshow_started_at =
                     std::chrono::steady_clock::now();
                 cv::imshow(state.window_name, frame);
                 const auto imshow_finished_at =
                     std::chrono::steady_clock::now();
-                state.stats.maximum_imshow_ms = std::max(
-                    state.stats.maximum_imshow_ms,
+                RecordImshowDuration(
+                    state,
                     std::chrono::duration<double, std::milli>(
                         imshow_finished_at -
                         imshow_started_at).count());
                 state.submitted_this_cycle = true;
+                submitted_frame = true;
             } catch (const std::exception& error) {
                 RecordRejectedFrame(state);
                 RCLCPP_ERROR(
@@ -227,12 +256,26 @@ public:
             // waitKey does not provide a portable delay until at least one
             // HighGUI window exists, so explicitly throttle the no-frame
             // startup path.
-            std::this_thread::sleep_for(kNoWindowPollInterval);
+            WaitForQueuedFrame(kNoWindowPollInterval);
             const auto now = std::chrono::steady_clock::now();
             for (auto& state : windows_) {
                 ReportDisplayStatsIfDue(state, now);
             }
-            return true;
+            return !StopRequested();
+        }
+
+        if (highgui_event_thread_started_) {
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& state : windows_) {
+                if (state.submitted_this_cycle) {
+                    RecordPresentedFrame(state, now);
+                }
+                ReportDisplayStatsIfDue(state, now);
+            }
+            if (!submitted_frame) {
+                WaitForQueuedFrame(kNoWindowPollInterval);
+            }
+            return !StopRequested();
         }
 
         const auto wait_key_started_at =
@@ -246,9 +289,7 @@ public:
                 wait_key_started_at).count();
         for (auto& state : windows_) {
             if (state.created) {
-                state.stats.maximum_wait_key_ms = std::max(
-                    state.stats.maximum_wait_key_ms,
-                    wait_key_ms);
+                RecordWaitKeyDuration(state, wait_key_ms);
             }
             if (state.submitted_this_cycle) {
                 RecordPresentedFrame(
@@ -257,6 +298,8 @@ public:
             ReportDisplayStatsIfDue(
                 state, wait_key_finished_at);
         }
+        WarnIfHighGuiIsSlow(
+            wait_key_ms, wait_key_finished_at);
         return key != 27 && key != 'q' && key != 'Q';
     }
 
@@ -286,6 +329,115 @@ public:
     }
 
 private:
+    void EnqueueReceivedFrame(
+        std::size_t index,
+        sensor_msgs::msg::Image::ConstSharedPtr message) {
+        const auto received_at =
+            std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        WindowState& state = windows_.at(index);
+        RecordReceivedFrameLocked(
+            state, *message, received_at);
+
+        if (state.pending_frames.size() >=
+            display_queue_depth_) {
+            if (fps_logging_enabled_) {
+                ++state.stats.window_backpressure_waits;
+                ++state.stats.total_backpressure_waits;
+            }
+            queue_not_full_condition_.wait(
+                lock,
+                [this, &state]() {
+                    return StopRequested() ||
+                           state.pending_frames.size() <
+                               display_queue_depth_;
+                });
+        }
+        if (StopRequested()) {
+            return;
+        }
+
+        state.pending_frames.push_back(std::move(message));
+        if (fps_logging_enabled_) {
+            state.stats.maximum_queue_depth = std::max(
+                state.stats.maximum_queue_depth,
+                state.pending_frames.size());
+        }
+        lock.unlock();
+        queue_not_empty_condition_.notify_one();
+    }
+
+    sensor_msgs::msg::Image::ConstSharedPtr TryTakeNextFrame(
+        WindowState& state) {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        if (state.pending_frames.empty()) {
+            return nullptr;
+        }
+
+        auto frame =
+            std::move(state.pending_frames.front());
+        state.pending_frames.pop_front();
+        lock.unlock();
+        queue_not_full_condition_.notify_all();
+        return frame;
+    }
+
+    void WaitForQueuedFrame(
+        std::chrono::steady_clock::duration timeout) {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_not_empty_condition_.wait_for(
+            lock,
+            timeout,
+            [this]() {
+                if (StopRequested()) {
+                    return true;
+                }
+                return std::any_of(
+                    windows_.begin(),
+                    windows_.end(),
+                    [](const WindowState& state) {
+                        return !state.pending_frames.empty();
+                    });
+            });
+    }
+
+    void StartHighGuiEventThreadIfSupported() {
+        if (highgui_event_thread_attempted_) {
+            return;
+        }
+        highgui_event_thread_attempted_ = true;
+        highgui_event_thread_started_ =
+            cv::startWindowThread() > 0;
+        if (highgui_event_thread_started_) {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[*] HighGUI event thread started; the display main "
+                "thread will not call blocking waitKey().");
+        } else {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] This HighGUI backend does not provide an event "
+                "thread; using main-thread waitKey() fallback.");
+        }
+    }
+
+    void WarnIfHighGuiIsSlow(
+        double wait_key_ms,
+        std::chrono::steady_clock::time_point now) {
+        if (wait_key_ms <= 100.0 ||
+            now - last_highgui_slow_warning_at_ <=
+                std::chrono::seconds(2)) {
+            return;
+        }
+        RCLCPP_WARN(
+            this->get_logger(),
+            "[?] HighGUI waitKey blocked for %.1f ms; ROS reception "
+            "continues on its independent thread and frames remain "
+            "queued in order.",
+            wait_key_ms);
+        last_highgui_slow_warning_at_ = now;
+    }
+
     void InitializeStatsWindow(
         DisplayStats& stats,
         std::chrono::steady_clock::time_point now) {
@@ -293,7 +445,7 @@ private:
         stats.window_started_at = now;
     }
 
-    void RecordReceivedFrame(
+    void RecordReceivedFrameLocked(
         WindowState& state,
         const sensor_msgs::msg::Image& message,
         std::chrono::steady_clock::time_point now) {
@@ -307,11 +459,6 @@ private:
         }
         ++stats.window_received_frames;
         ++stats.total_received_frames;
-
-        if (state.pending_frame != nullptr) {
-            ++stats.window_overwritten_frames;
-            ++stats.total_overwritten_frames;
-        }
 
         const auto sequence =
             pointcloud_visualization::
@@ -341,10 +488,35 @@ private:
         }
     }
 
+    void RecordImshowDuration(
+        WindowState& state,
+        double imshow_ms) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        state.stats.maximum_imshow_ms = std::max(
+            state.stats.maximum_imshow_ms,
+            imshow_ms);
+    }
+
+    void RecordWaitKeyDuration(
+        WindowState& state,
+        double wait_key_ms) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        state.stats.maximum_wait_key_ms = std::max(
+            state.stats.maximum_wait_key_ms,
+            wait_key_ms);
+    }
+
     void RecordRejectedFrame(WindowState& state) {
         if (!fps_logging_enabled_) {
             return;
         }
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         ++state.stats.window_rejected_frames;
         ++state.stats.total_rejected_frames;
     }
@@ -356,6 +528,7 @@ private:
             return;
         }
 
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         DisplayStats& stats = state.stats;
         if (!stats.window_initialized) {
             InitializeStatsWindow(stats, now);
@@ -378,10 +551,14 @@ private:
         WindowState& state,
         std::chrono::steady_clock::time_point now) {
         if (!fps_logging_enabled_ ||
-            !state.stats.window_initialized) {
+            StopRequested()) {
             return;
         }
 
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (!state.stats.window_initialized) {
+            return;
+        }
         DisplayStats& stats = state.stats;
         const double elapsed_sec =
             std::chrono::duration<double>(
@@ -404,10 +581,11 @@ private:
             "(+%llu, total %llu) | presented %.1f FPS "
             "(+%llu, total %llu) | %.1f s window | "
             "max display gap %.0f ms | HighGUI max imshow %.1f ms / "
-            "waitKey %.1f ms | overwritten +%llu (total %llu) | "
+            "waitKey %.1f ms | queue %zu current / %zu max / %zu "
+            "capacity | backpressure waits +%llu (total %llu) | "
             "missing +%llu (total %llu) | out-of-order +%llu "
             "(total %llu) | unsequenced +%llu (total %llu) | "
-            "rejected +%llu (total %llu) | pending %d.",
+            "rejected +%llu (total %llu).",
             state.window_name.c_str(),
             received_fps,
             static_cast<unsigned long long>(
@@ -423,10 +601,13 @@ private:
             stats.maximum_display_gap_ms,
             stats.maximum_imshow_ms,
             stats.maximum_wait_key_ms,
+            state.pending_frames.size(),
+            stats.maximum_queue_depth,
+            display_queue_depth_,
             static_cast<unsigned long long>(
-                stats.window_overwritten_frames),
+                stats.window_backpressure_waits),
             static_cast<unsigned long long>(
-                stats.total_overwritten_frames),
+                stats.total_backpressure_waits),
             static_cast<unsigned long long>(
                 stats.window_missing_frames),
             static_cast<unsigned long long>(
@@ -442,13 +623,12 @@ private:
             static_cast<unsigned long long>(
                 stats.window_rejected_frames),
             static_cast<unsigned long long>(
-                stats.total_rejected_frames),
-            state.pending_frame != nullptr ? 1 : 0);
+                stats.total_rejected_frames));
 
         stats.window_started_at = now;
         stats.window_received_frames = 0;
         stats.window_presented_frames = 0;
-        stats.window_overwritten_frames = 0;
+        stats.window_backpressure_waits = 0;
         stats.window_missing_frames = 0;
         stats.window_out_of_order_frames = 0;
         stats.window_unsequenced_frames = 0;
@@ -456,11 +636,22 @@ private:
         stats.maximum_display_gap_ms = 0.0;
         stats.maximum_imshow_ms = 0.0;
         stats.maximum_wait_key_ms = 0.0;
+        stats.maximum_queue_depth =
+            state.pending_frames.size();
     }
 
     std::vector<WindowState> windows_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_not_empty_condition_;
+    std::condition_variable queue_not_full_condition_;
+    std::atomic<bool> stopping_{false};
+    std::size_t display_queue_depth_ = 10;
     bool fps_logging_enabled_ = true;
     double fps_logging_interval_sec_ = 5.0;
+    bool highgui_event_thread_attempted_ = false;
+    bool highgui_event_thread_started_ = false;
+    std::chrono::steady_clock::time_point
+        last_highgui_slow_warning_at_;
 };
 
 }  // namespace
@@ -469,15 +660,33 @@ int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
     int exit_code = 0;
     std::shared_ptr<InterpolationDisplayNode> node;
+    rclcpp::executors::SingleThreadedExecutor executor;
+    std::thread ros_receiver_thread;
+    std::exception_ptr ros_receiver_failure;
+    bool node_added_to_executor = false;
 
     try {
         node = std::make_shared<InterpolationDisplayNode>();
-        rclcpp::executors::SingleThreadedExecutor executor;
         executor.add_node(node);
+        node_added_to_executor = true;
+        ros_receiver_thread = std::thread(
+            [&executor,
+             &node,
+             &ros_receiver_failure]() {
+                try {
+                    executor.spin();
+                } catch (...) {
+                    ros_receiver_failure =
+                        std::current_exception();
+                    node->RequestStop();
+                    if (rclcpp::ok()) {
+                        rclcpp::shutdown();
+                    }
+                }
+            });
 
-        while (rclcpp::ok()) {
-            // spin_some invokes every image callback on this main thread.
-            executor.spin_some();
+        while (rclcpp::ok() &&
+               !node->StopRequested()) {
             if (!node->PresentReadyFramesAndProcessEvents()) {
                 RCLCPP_INFO(
                     node->get_logger(),
@@ -486,15 +695,56 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        executor.remove_node(node);
+        node->RequestStop();
+        executor.cancel();
+        if (rclcpp::ok()) {
+            rclcpp::shutdown();
+        }
+        if (ros_receiver_thread.joinable()) {
+            ros_receiver_thread.join();
+        }
+        if (node_added_to_executor) {
+            executor.remove_node(node);
+            node_added_to_executor = false;
+        }
+        if (ros_receiver_failure != nullptr) {
+            std::rethrow_exception(ros_receiver_failure);
+        }
         node->DestroyWindows();
     } catch (const std::exception& error) {
+        if (node != nullptr) {
+            node->RequestStop();
+        }
+        executor.cancel();
+        if (rclcpp::ok()) {
+            rclcpp::shutdown();
+        }
+        if (ros_receiver_thread.joinable()) {
+            ros_receiver_thread.join();
+        }
+        if (node_added_to_executor && node != nullptr) {
+            executor.remove_node(node);
+            node_added_to_executor = false;
+        }
         RCLCPP_FATAL(
             rclcpp::get_logger("interpolation_display_node"),
             "[!] Interpolation display failed: %s",
             error.what());
         exit_code = 1;
     } catch (...) {
+        if (node != nullptr) {
+            node->RequestStop();
+        }
+        executor.cancel();
+        if (rclcpp::ok()) {
+            rclcpp::shutdown();
+        }
+        if (ros_receiver_thread.joinable()) {
+            ros_receiver_thread.join();
+        }
+        if (node_added_to_executor && node != nullptr) {
+            executor.remove_node(node);
+        }
         RCLCPP_FATAL(
             rclcpp::get_logger("interpolation_display_node"),
             "[!] Interpolation display failed with an unknown exception.");
@@ -502,8 +752,5 @@ int main(int argc, char* argv[]) {
     }
 
     node.reset();
-    if (rclcpp::ok()) {
-        rclcpp::shutdown();
-    }
     return exit_code;
 }

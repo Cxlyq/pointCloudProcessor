@@ -27,21 +27,14 @@ struct DisInterpolationConfig {
     cv::Scalar border_color_bgr = cv::Scalar(0.0, 0.0, 0.0);
     std::size_t max_pending_pairs = 1;
     std::size_t max_ready_sequences = 1;
-    std::chrono::steady_clock::duration max_playback_lag =
-        std::chrono::seconds(1);
 };
 
 struct DisDisplayTiming {
     bool starts_new_sequence = false;
-    bool latency_reset = false;
-    std::size_t skipped_frames = 0;
-    double lag_before_reset_ms = 0.0;
 };
 
 struct DisQueueStats {
     std::uint64_t coalesced_source_frames = 0;
-    std::uint64_t skipped_display_frames = 0;
-    std::uint64_t latency_resets = 0;
     std::size_t pending_pairs = 0;
     std::size_t ready_sequences = 0;
     bool worker_busy = false;
@@ -114,8 +107,6 @@ private:
         previous_source_timestamp_;
     bool source_timestamp_fallback_active_ = false;
     std::uint64_t coalesced_source_frames_ = 0;
-    std::uint64_t skipped_display_frames_ = 0;
-    std::uint64_t latency_resets_ = 0;
     std::deque<FramePair> pending_pairs_;
     std::deque<FrameSequence> ready_sequences_;
     std::string last_status_;

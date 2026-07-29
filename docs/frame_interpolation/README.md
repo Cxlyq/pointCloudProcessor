@@ -65,17 +65,20 @@ ros2 launch visualization v_dis_quality_x20.launch.py
 三个插帧入口会同时启动 `visualization_node` 和 `interpolation_display_node` 两个
 ROS 2 进程。Open3D 源渲染窗口在生成进程中保持隐藏，并且只在新网格到达时渲染一次；
 生成完成的中间帧按 deadline 发布到本机
-`interpolated_frames/<camera_id>` 图像话题。显示进程的
-主线程负责 OpenCV 窗口的创建、`imshow()`、`waitKey()` 和销毁。因此无论 OpenCV 使用
-Qt、GTK 还是 Win32 后端，都不会从工作线程创建 GUI；较慢的 HighGUI 后端也不会阻塞
-Open3D 所在进程。
+`interpolated_frames/<camera_id>` 图像话题。发布端和显示端使用 reliable KeepAll
+DDS；显示进程用有界 FIFO 保存已经进入回调的帧，队列满时通过 DDS 向发布端反压。
+ROS 接收由独立线程负责，
+显示进程主线程只负责 OpenCV 窗口的创建、`imshow()`、事件处理和销毁。因此 HighGUI
+阻塞不会再阻塞 ROS 回调，也不会因单帧缓存覆盖而静默丢帧。
 
 Worker 会先把完整 `FrameSequence` 放入 ready 队列，再通知输出调度线程。输出调度线程
-按下一帧截止时间唤醒；10 ms 轮询只用于等待 DDS 发现尚未连接的显示订阅者。若一次唤醒时
-已有多张帧过期，只发布其中最新的到期帧，避免恢复后突发快速刷出旧帧。正常情况下仍按
-真实帧间隔计算的时间线连续播放；只有播放截止时间实际落后超过
-`interpolation_max_playback_lag_ms`（默认 `1000` ms）时，才丢弃旧队列并跳到当前
-最新真实帧。这个跳变只用于输入、计算或显示后端异常造成的严重积压。
+按下一帧截止时间唤醒；10 ms 轮询只用于等待 DDS 发现尚未连接的显示订阅者。一次调度
+最多发布一帧，即使已经迟到也不会跨过中间帧；下一帧从本次实际发布时间重新计时。因此
+消费端过慢时表现为播放时间线变长和 reliable 反压，而不是从一段中间跳到下一段。
+
+显示窗口创建后会恢复多线程改造前使用的 `cv::startWindowThread()` 事件驱动方式。后端
+支持时不再调用可能长时间阻塞的 `waitKey(1)`；后端不支持时才使用 `waitKey()` 回退，
+此时 ROS 接收线程和 FIFO 仍会继续工作，并通过日志报告队列积压与反压次数。
 
 ## 版本对照
 
@@ -83,8 +86,8 @@ Worker 会先把完整 `FrameSequence` 放入 ready 队列，再通知输出调�
 | --- | ---: | ---: | --- | --- |
 | `v_vis.launch.py` | 0 | 无 | 无 | 原始可视化基线 |
 | `v_dis_ultrafast.launch.py` | 4 | 1/4 | 单向 | 保留的低开销基础版 |
-| `v_dis_bidirectional.launch.py` | 4 | 1/4 | 双向 + 一致性掩码 | 对照轮廓重影 |
-| `v_dis_quality_x20.launch.py` | 19 | 1/2 | 单向 | 本轮帧数与清晰度测试 |
+| `v_dis_bidirectional.launch.py` | 4 | 1/4 | 双向 + 一致性掩码 | 当前统一使用的 x5 版本 |
+| `v_dis_quality_x20.launch.py` | 19 | 1/2 | 单向 | 保留的历史压力测试，不作为当前运行方案 |
 
 不要同时启动多个可视化 launch；需要比较时，先停止当前可视化节点再切换。
 
@@ -108,23 +111,22 @@ fps_logging_interval_sec: 5.0
 插帧版本同时输出：
 
 ```text
-[GEN] Single-direction DIS: 19 intermediate display frames in 320.5 ms
-[SRC] Rendered "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
-[TX] Interpolated "...": published playback 9.8 FPS | published effective 8.7 FPS | 5.1 s window | max publish gap 410 ms | coalesced +1 (total 4) | skipped +0 (total 2) | resets +0 (total 0) | queue 1 pending / 0 ready / 6 active | worker busy | lag 12.3 ms.
-[FPS] Display "...": received 8.2 FPS (+41, total 82) | presented 6.0 FPS (+30, total 60) | 5.0 s window | max display gap 405 ms | HighGUI max imshow 1.2 ms / waitKey 280.0 ms | overwritten +11 (total 22) | missing +4 (total 8) | out-of-order +0 (total 0) | unsequenced +0 (total 0) | rejected +0 (total 0) | pending 0.
+[GEN] Bidirectional DIS + consistency mask: 4 intermediate display frames in 190.5 ms
+[SRC] Rendered "...": 1.80 FPS | 5.0 s window | max gap 610 ms | superseded meshes +0 (total 0).
+[TX] Interpolated "...": published playback 9.0 FPS | published effective 8.8 FPS | 5.0 s window | max publish gap 150 ms | coalesced +0 (total 0) | queue 0 pending / 0 ready / 4 active | worker idle | lag 0.0 ms.
+[FPS] Display "...": received 8.8 FPS (+44, total 88) | presented 8.8 FPS (+44, total 88) | 5.0 s window | max display gap 151 ms | HighGUI max imshow 1.2 ms / waitKey 0.0 ms | queue 0 current / 2 max / 10 capacity | backpressure waits +0 (total 0) | missing +0 (total 0) | out-of-order +0 (total 0) | unsequenced +0 (total 0) | rejected +0 (total 0).
 ```
 
 - `[TX]` 只统计生成进程调用图像发布的频率，不代表窗口实际显示帧率；
 - `[FPS] Display` 的 `received` 是显示节点回调实际收到的帧率；
-- `presented` 在新帧完成 `imshow()` 和一次 `waitKey()` 事件处理后计数，是正式显示 FPS；
+- `presented` 是显示主线程实际提交给 HighGUI 的帧率，是正式显示端 FPS；
 - `max display gap` 是相邻 presented 帧的最大时间间隔；
 - `HighGUI max imshow / waitKey` 用于定位窗口后端是否阻塞显示消费；
 - `missing` 根据发布端写入图像消息头的单调编号统计，表示帧在发布后、显示回调前丢失；
-- `overwritten` 表示显示回调已经收到帧，但单帧 pending 缓存尚未消费就被下一帧覆盖；
+- `queue current / max / capacity` 是显示进程 FIFO 的当前、窗口内最大和容量；
+- `backpressure waits` 表示 FIFO 已满、ROS 回调等待显示端腾出位置的次数；
 - `out-of-order / unsequenced / rejected` 分别表示乱序、缺少有效诊断编号和图像校验失败；
 - `+N (total M)`：`N` 是当前统计窗口新增次数，`M` 是进程启动后的累计次数；
-- `skipped`：输出调度线程迟到时被更新的到期帧，以及超出最大延迟后被清理的排队帧；
-- `resets`：播放延迟超过阈值并跳到最新真实帧的次数；
 - `pending / ready / active`：待生成的真实帧对、已生成序列，以及当前播放序列剩余帧数；
 - `worker` 和 `lag`：生成线程是否忙碌，以及当前活动帧超过播放截止时间的毫秒数；
 - `[GEN]`：每对真实帧生成的中间显示帧数量和总耗时。
@@ -133,19 +135,18 @@ fps_logging_interval_sec: 5.0
 周期使用被合并源间隔的平均值，而不是把多个源间隔总和当成一个周期，因此连续输入
 间隔相近时不会因为一次合并把名义播放帧率减半。
 
-发生最大延迟重置时会额外输出 `[LATENCY]` 警告，其中包含重置前延迟和清理帧数。
-这里的 `lag` 是相对播放截止时间的调度迟到，不是“最新真实帧到达后经过了多久”；
-因此正常的低源帧率和允许的首段等待不会触发重置。
+`lag` 是相对播放截止时间的调度迟到，不是“最新真实帧到达后经过了多久”。迟到不会
+触发跳帧或重置；调度器提交当前帧后从实际提交时刻安排下一帧。
 
 OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此 `presented` 的
-测量边界是应用完成 `imshow()` 和 `waitKey()`，不等同于显示器物理扫描时刻。诊断版本
-暂时保留 `KeepLast(1) + best_effort` 和单帧 pending 缓存，以便通过 `missing` 与
-`overwritten` 区分丢帧位置；增加统计本身不改变当前播放策略。
+测量边界是应用把新帧提交给 HighGUI，不等同于显示器物理扫描时刻。正常运行时
+`TX ≈ received ≈ presented`、`missing = 0`、`backpressure waits = 0`；若
+`received ≈ TX` 但 `presented` 较低并且 FIFO 上升，瓶颈仍在 HighGUI。
 
 ## 自动化验证
 
-插值器测试覆盖合并时间间隔、显示帧所有权、ready 入队通知、到期帧合并、1 秒最大延迟
-策略、队列状态与播放延迟、消息时间戳回退、尺寸变化重置，以及双向一致性路径；另有
+插值器测试覆盖合并时间间隔、显示帧所有权、ready 入队通知、迟到时逐帧连续播放、
+ready 队列反压、队列状态与播放延迟、消息时间戳回退、尺寸变化重置，以及双向一致性路径；另有
 测试验证连续图像、带 stride 的 ROI 和畸形 `sensor_msgs/Image` 转换：
 
 ```bash

@@ -116,8 +116,6 @@ struct CamConfig {
     FpsWindow interpolation_fps;
     std::uint64_t last_reported_superseded_mesh_count = 0;
     std::uint64_t last_reported_coalesced_source_frames = 0;
-    std::uint64_t last_reported_skipped_display_frames = 0;
-    std::uint64_t last_reported_latency_resets = 0;
     std::uint64_t next_interpolated_frame_sequence = 1;
 };
 
@@ -139,7 +137,7 @@ public:
         this->declare_parameter<std::string>(
             "interpolation_timing_source", "arrival");
         this->declare_parameter<std::int64_t>(
-            "interpolation_max_playback_lag_ms", 1000);
+            "interpolation_display_queue_depth", 10);
         this->declare_parameter<bool>("interpolation_lock_camera", false);
         this->declare_parameter<bool>("interpolation_show_source_window", false);
         this->declare_parameter<std::string>(
@@ -180,9 +178,9 @@ public:
         interpolation_timing_source_ =
             this->get_parameter(
                 "interpolation_timing_source").as_string();
-        interpolation_max_playback_lag_ms_ =
+        interpolation_display_queue_depth_ =
             this->get_parameter(
-                "interpolation_max_playback_lag_ms").as_int();
+                "interpolation_display_queue_depth").as_int();
         interpolation_lock_camera_ =
             this->get_parameter("interpolation_lock_camera").as_bool();
         interpolation_show_source_window_ =
@@ -220,15 +218,11 @@ public:
                     "interpolation_flow_consistency_mask requires "
                     "interpolation_bidirectional_flow");
             }
-            const auto maximum_supported_lag_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::duration::max()).count();
-            if (interpolation_max_playback_lag_ms_ <= 0 ||
-                interpolation_max_playback_lag_ms_ >
-                    maximum_supported_lag_ms) {
+            if (interpolation_display_queue_depth_ <= 0 ||
+                interpolation_display_queue_depth_ > 1000) {
                 throw std::invalid_argument(
-                    "interpolation_max_playback_lag_ms must be a "
-                    "positive supported duration");
+                    "interpolation_display_queue_depth must be "
+                    "in [1, 1000]");
             }
             interpolation_dis_preset_ =
                 parse_dis_preset(interpolation_dis_preset_name_);
@@ -374,9 +368,6 @@ public:
                     interpolation_flow_consistency_mask_;
                 interpolation_config.use_source_timestamps =
                     interpolation_use_message_timestamps_;
-                interpolation_config.max_playback_lag =
-                    std::chrono::milliseconds(
-                        interpolation_max_playback_lag_ms_);
                 interpolation_config.border_color_bgr = cv::Scalar(
                     cfg.bg_color.z() * 255.0,
                     cfg.bg_color.y() * 255.0,
@@ -391,8 +382,8 @@ public:
                         [this]() {
                             NotifyPresentationThread();
                         });
-                rclcpp::QoS image_qos(rclcpp::KeepLast(1));
-                image_qos.best_effort();
+                rclcpp::QoS image_qos(rclcpp::KeepAll());
+                image_qos.reliable();
                 cfg.interpolation_frame_publisher =
                     this->create_publisher<
                         sensor_msgs::msg::Image>(
@@ -440,11 +431,12 @@ public:
             RCLCPP_INFO(
                 this->get_logger(),
                 "[*] Interpolated frames are deadline-scheduled on a "
-                "worker and published to \"%s/<camera_id>\"; maximum "
-                "playback lag is %lld ms.",
+                "worker and published with reliable KeepAll QoS to "
+                "\"%s/<camera_id>\". The display FIFO depth is %lld; "
+                "playback never skips an already generated frame.",
                 kInterpolatedFrameTopic,
                 static_cast<long long>(
-                    interpolation_max_playback_lag_ms_));
+                    interpolation_display_queue_depth_));
             RCLCPP_INFO(
                 this->get_logger(),
                 "[*] Bidirectional flow consistency masking is %s.",
@@ -804,26 +796,6 @@ private:
             return;
         }
 
-        if (timing.latency_reset) {
-            RCLCPP_WARN(
-                this->get_logger(),
-                "[LATENCY] \"%s\" playback lag %.1f ms exceeded "
-                "%lld ms; discarded %zu queued display frames and "
-                "reset to the latest real frame.",
-                item.interpolation_window_name.c_str(),
-                timing.lag_before_reset_ms,
-                static_cast<long long>(
-                    interpolation_max_playback_lag_ms_),
-                timing.skipped_frames);
-        } else if (timing.skipped_frames > 0) {
-            RCLCPP_DEBUG(
-                this->get_logger(),
-                "[LATENCY] \"%s\" skipped %zu overdue display "
-                "frames in one presentation cycle.",
-                item.interpolation_window_name.c_str(),
-                timing.skipped_frames);
-        }
-
         sensor_msgs::msg::Image message =
             pointcloud_visualization::BgrMatToImageMessage(
                 interpolated_frame);
@@ -936,10 +908,6 @@ private:
                 item.interpolator->GetQueueStats();
             item.last_reported_coalesced_source_frames =
                 queue_stats.coalesced_source_frames;
-            item.last_reported_skipped_display_frames =
-                queue_stats.skipped_display_frames;
-            item.last_reported_latency_resets =
-                queue_stats.latency_resets;
             InitializeFpsWindow(window, now);
             return;
         }
@@ -975,27 +943,15 @@ private:
         const std::uint64_t coalesced_source_frame_delta =
             queue_stats.coalesced_source_frames -
             item.last_reported_coalesced_source_frames;
-        const std::uint64_t skipped_display_frame_delta =
-            queue_stats.skipped_display_frames -
-            item.last_reported_skipped_display_frames;
-        const std::uint64_t latency_reset_delta =
-            queue_stats.latency_resets -
-            item.last_reported_latency_resets;
         item.last_reported_coalesced_source_frames =
             queue_stats.coalesced_source_frames;
-        item.last_reported_skipped_display_frames =
-            queue_stats.skipped_display_frames;
-        item.last_reported_latency_resets =
-            queue_stats.latency_resets;
         RCLCPP_INFO(
             this->get_logger(),
             "[TX] Interpolated \"%s\": published playback %.1f FPS | "
             "published effective %.1f FPS | %.1f s window | "
             "max publish gap %.0f ms | "
-            "coalesced +%llu (total %llu) | skipped +%llu "
-            "(total %llu) | resets +%llu (total %llu) | queue %zu "
-            "pending / %zu ready / %zu active | worker %s | "
-            "lag %.1f ms.",
+            "coalesced +%llu (total %llu) | queue %zu pending / "
+            "%zu ready / %zu active | worker %s | lag %.1f ms.",
             item.interpolation_window_name.c_str(),
             playback_fps,
             effective_fps,
@@ -1005,14 +961,6 @@ private:
                 coalesced_source_frame_delta),
             static_cast<unsigned long long>(
                 queue_stats.coalesced_source_frames),
-            static_cast<unsigned long long>(
-                skipped_display_frame_delta),
-            static_cast<unsigned long long>(
-                queue_stats.skipped_display_frames),
-            static_cast<unsigned long long>(
-                latency_reset_delta),
-            static_cast<unsigned long long>(
-                queue_stats.latency_resets),
             queue_stats.pending_pairs,
             queue_stats.ready_sequences,
             queue_stats.active_frames_remaining,
@@ -1174,7 +1122,7 @@ private:
     bool interpolation_flow_consistency_mask_ = false;
     std::string interpolation_timing_source_ = "arrival";
     bool interpolation_use_message_timestamps_ = false;
-    std::int64_t interpolation_max_playback_lag_ms_ = 1000;
+    std::int64_t interpolation_display_queue_depth_ = 10;
     bool interpolation_lock_camera_ = false;
     bool interpolation_show_source_window_ = false;
     std::string interpolation_window_suffix_ = " - DIS Interpolated";

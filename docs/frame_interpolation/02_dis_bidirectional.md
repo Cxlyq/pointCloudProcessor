@@ -20,9 +20,8 @@ F10 = DIS(I1, I0)
 ```
 
 两张图分别使用各自方向的流场变形到中间时刻，再进行融合。当前第一版先使用真实
-双向流替代阶段 1 的反向近似，并可选计算前后向一致性掩码。默认双向配置已启用该
-掩码：若一个端点的流在往返映射后仍一致、另一个端点不一致，则遮挡边界优先采用
-一致端点；两端都一致或都不一致时保留原来的线性融合，避免掩码误判产生空洞。
+双向流替代阶段 1 的反向近似，并可选计算前后向一致性掩码。当前双向配置继续启用该
+掩码；本次连续性修复不改变这一既有画质策略。
 
 该功能只在 `interpolation_flow_consistency_mask: true` 时执行额外的全分辨率检查，
 单向和 x20 配置默认关闭，不增加它们的计算量。掩码必须与
@@ -35,6 +34,7 @@ F10 = DIS(I1, I0)
 - `src/visualization/include/visualization/dis_frame_interpolator.hpp`
 - `src/visualization/src/dis_frame_interpolator.cpp`
 - `src/visualization/src/visualization_node.cpp`
+- `src/visualization/src/interpolation_display_node.cpp`
 - `src/visualization/config/v_dis_bidirectional_config.yaml`
 - `src/visualization/launch/v_dis_bidirectional.launch.py`
 
@@ -66,9 +66,11 @@ interpolation_flow_scale: 0.5
 interpolation_dis_preset: "fast"
 ```
 
-该入口与单向版本共用独立的 `interpolation_display_node` 显示进程和
-`interpolation_max_playback_lag_ms: 1000` 策略：普通调度迟到只保留最新到期帧，
-超过 1 秒的异常积压才跳到最新真实帧。
+该入口使用独立的 `interpolation_display_node` 显示进程。发布与订阅均使用
+`reliable + KeepAll`，显示回调将收到的帧按序放入深度 10 的 FIFO；队列满时向发布端
+反压，而不是覆盖旧帧。ROS 接收线程不会被
+HighGUI 的事件处理阻塞。输出调度迟到时一次只提交当前帧，并从实际提交时刻安排
+下一帧，不再跳过中间帧或重置到最新真实帧。
 
 ## 计算开销
 

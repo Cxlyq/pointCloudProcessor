@@ -10,10 +10,11 @@
     interpolation_flow_scale: 0.25
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: true
-    # Reject forward/backward flow disagreements at disocclusions.
+    # Existing bidirectional quality setting; this patch does not change it.
     interpolation_flow_consistency_mask: true
     interpolation_timing_source: "arrival"
-    interpolation_max_playback_lag_ms: 1000
+    # Application FIFO depth; reliable KeepAll DDS carries backpressure.
+    interpolation_display_queue_depth: 10
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - Bidirectional DIS x5"

@@ -82,11 +82,6 @@ DisFrameInterpolator::DisFrameInterpolator(
     if (config_.max_pending_pairs == 0 || config_.max_ready_sequences == 0) {
         throw std::invalid_argument("interpolation queue limits must be greater than zero");
     }
-    if (config_.max_playback_lag <=
-        std::chrono::steady_clock::duration::zero()) {
-        throw std::invalid_argument(
-            "interpolation max_playback_lag must be greater than zero");
-    }
     if (config_.use_flow_consistency_mask &&
         !config_.use_bidirectional_flow) {
         throw std::invalid_argument(
@@ -231,12 +226,8 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
     }
 
     bool released_ready_slot = false;
-    bool reset_playback = false;
     cv::Mat display_frame;
-    cv::Mat latest_real_frame;
     std::vector<std::vector<cv::Mat>> retired_active_sequences;
-    std::deque<FrameSequence> retired_ready_sequences;
-    std::deque<FramePair> retired_pending_pairs;
     std::unique_lock<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
 
@@ -260,14 +251,9 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
             active_frame_period_ = sequence.frame_period;
             active_frame_index_ = 0;
             if (sequence.delay_before_first_frame) {
-                if (playback_timeline_initialized_) {
-                    next_frame_deadline_ +=
-                        active_frame_period_;
-                } else {
-                    next_frame_deadline_ =
-                        now + active_frame_period_;
-                    playback_timeline_initialized_ = true;
-                }
+                next_frame_deadline_ =
+                    now + active_frame_period_;
+                playback_timeline_initialized_ = true;
             } else {
                 next_frame_deadline_ = now;
                 playback_timeline_initialized_ = false;
@@ -284,105 +270,43 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
         return false;
     }
 
-    if (playback_timeline_initialized_ &&
-        now > next_frame_deadline_) {
-        const auto playback_lag = now - next_frame_deadline_;
-        if (playback_lag > config_.max_playback_lag) {
-            std::size_t discarded_frames =
-                active_frames_.size() - active_frame_index_;
-            for (const auto& sequence : ready_sequences_) {
-                discarded_frames += sequence.frames.size();
-            }
-
-            ++generation_;
-            skipped_display_frames_ += discarded_frames;
-            ++latency_resets_;
-
-            retired_active_sequences.push_back(
-                std::move(active_frames_));
-            active_frames_.clear();
-            retired_ready_sequences.swap(ready_sequences_);
-            retired_pending_pairs.swap(pending_pairs_);
-            latest_real_frame = previous_real_frame_;
-
-            active_frame_index_ = 0;
-            active_frame_period_ =
-                std::chrono::steady_clock::duration::zero();
-            next_frame_deadline_ = now;
-            playback_timeline_initialized_ = false;
-            reset_playback = true;
-
-            if (timing != nullptr) {
-                timing->starts_new_sequence = true;
-                timing->latency_reset = true;
-                timing->skipped_frames = discarded_frames;
-                timing->lag_before_reset_ms =
-                    std::chrono::duration<double, std::milli>(
-                        playback_lag).count();
-            }
+    if (now < next_frame_deadline_) {
+        lock.unlock();
+        if (released_ready_slot) {
+            condition_.notify_all();
         }
+        return false;
     }
 
-    if (!reset_playback) {
-        bool has_display_frame = false;
-        bool display_starts_new_sequence = false;
-        std::size_t skipped_frames = 0;
+    if (timing != nullptr) {
+        timing->starts_new_sequence =
+            active_frame_index_ == 0;
+    }
+    display_frame =
+        active_frames_[active_frame_index_];
+    ++active_frame_index_;
 
-        while (!active_frames_.empty() &&
-               now >= next_frame_deadline_) {
-            if (has_display_frame) {
-                ++skipped_frames;
-            }
-            display_frame =
-                active_frames_[active_frame_index_];
-            display_starts_new_sequence =
-                active_frame_index_ == 0;
-            has_display_frame = true;
-            ++active_frame_index_;
-
-            if (active_frame_index_ >= active_frames_.size()) {
-                // Move large image batches out while locked, then release
-                // their storage after unlocking.
-                retired_active_sequences.push_back(
-                    std::move(active_frames_));
-                active_frames_.clear();
-                active_frame_index_ = 0;
-                activate_next_sequence();
-            } else {
-                next_frame_deadline_ +=
-                    active_frame_period_;
-            }
-        }
-
-        skipped_display_frames_ += skipped_frames;
-        if (timing != nullptr) {
-            timing->starts_new_sequence =
-                display_starts_new_sequence;
-            timing->skipped_frames = skipped_frames;
-        }
-
-        if (!has_display_frame) {
-            lock.unlock();
-            if (released_ready_slot) {
-                // A blocked producer may now publish the next contiguous
-                // sequence.
-                condition_.notify_all();
-            }
-            return false;
-        }
+    if (active_frame_index_ >= active_frames_.size()) {
+        // Move the completed image batch out while locked, then release its
+        // storage after unlocking. The next sequence starts one complete
+        // frame period later instead of catching up by dropping frames.
+        retired_active_sequences.push_back(
+            std::move(active_frames_));
+        active_frames_.clear();
+        active_frame_index_ = 0;
+        playback_timeline_initialized_ = false;
+        activate_next_sequence();
+    } else {
+        next_frame_deadline_ =
+            now + active_frame_period_;
+        playback_timeline_initialized_ = true;
     }
 
     lock.unlock();
-    if (released_ready_slot || reset_playback) {
+    if (released_ready_slot) {
         condition_.notify_all();
     }
-    if (reset_playback) {
-        // The latest real frame is retained internally as an interpolation
-        // endpoint. Keep the display boundary writable without aliasing it.
-        bgr_frame = latest_real_frame.clone();
-    } else {
-        bgr_frame = std::move(display_frame);
-    }
+    bgr_frame = std::move(display_frame);
     return true;
 }
 
@@ -418,8 +342,6 @@ DisQueueStats DisFrameInterpolator::GetQueueStats() {
 
     DisQueueStats stats;
     stats.coalesced_source_frames = coalesced_source_frames_;
-    stats.skipped_display_frames = skipped_display_frames_;
-    stats.latency_resets = latency_resets_;
     stats.pending_pairs = pending_pairs_.size();
     stats.ready_sequences = ready_sequences_.size();
     stats.worker_busy = worker_busy_;

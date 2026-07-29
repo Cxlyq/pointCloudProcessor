@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <gtest/gtest.h>
 #include <opencv2/core.hpp>
@@ -112,18 +113,6 @@ TEST(DisFrameInterpolatorTest, ConsistencyMaskRequiresBidirectionalFlow) {
         std::invalid_argument);
 }
 
-TEST(DisFrameInterpolatorTest, RejectsNonPositiveMaximumPlaybackLag) {
-    DisInterpolationConfig config;
-    config.max_playback_lag =
-        std::chrono::steady_clock::duration::zero();
-
-    EXPECT_THROW(
-        {
-            DisFrameInterpolator interpolator(config);
-        },
-        std::invalid_argument);
-}
-
 TEST(DisFrameInterpolatorTest, NotifiesAfterCompleteSequenceIsReady) {
     std::mutex notification_mutex;
     std::condition_variable notification_condition;
@@ -181,12 +170,43 @@ TEST(DisFrameInterpolatorTest, NotifiesAfterCompleteSequenceIsReady) {
     EXPECT_FALSE(stats.worker_busy);
 }
 
-TEST(DisFrameInterpolatorTest, PresentsOnlyLatestCurrentlyDueFrame) {
+TEST(DisFrameInterpolatorTest, ReadyQueueBackpressurePreservesSequences) {
+    DisInterpolationConfig config;
+    config.intermediate_frame_count = 0;
+    config.max_pending_pairs = 2;
+    config.max_ready_sequences = 1;
+    DisFrameInterpolator interpolator(config);
+
+    const auto first_arrival = std::chrono::steady_clock::now();
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 10), first_arrival);
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 20),
+        first_arrival + 20ms);
+    interpolator.SubmitFrame(
+        SolidFrame(16, 16, 30),
+        first_arrival + 40ms);
+
+    cv::Mat first;
+    cv::Mat second;
+    cv::Mat third;
+    ASSERT_TRUE(WaitForDisplayFrame(interpolator, first));
+    ASSERT_TRUE(WaitForDisplayFrame(interpolator, second));
+    ASSERT_TRUE(WaitForDisplayFrame(interpolator, third));
+
+    EXPECT_NEAR(cv::mean(first)[0], 10.0, 1.0);
+    EXPECT_NEAR(cv::mean(second)[0], 20.0, 1.0);
+    EXPECT_NEAR(cv::mean(third)[0], 30.0, 1.0);
+    EXPECT_EQ(
+        interpolator.GetQueueStats().coalesced_source_frames,
+        0U);
+}
+
+TEST(DisFrameInterpolatorTest, LatePlaybackPresentsEveryFrameInOrder) {
     DisInterpolationConfig config;
     config.intermediate_frame_count = 4;
     config.flow_scale = 1.0;
     config.dis_preset = cv::DISOpticalFlow::PRESET_ULTRAFAST;
-    config.max_playback_lag = 5s;
     DisFrameInterpolator interpolator(config);
 
     const auto first_arrival = std::chrono::steady_clock::now();
@@ -204,88 +224,55 @@ TEST(DisFrameInterpolatorTest, PresentsOnlyLatestCurrentlyDueFrame) {
         return stats.ready_sequences == 1 && !stats.worker_busy;
     }));
 
+    // Activating an interpolated sequence schedules its first intermediate
+    // frame one frame period after the preceding real frame.
     cv::Mat not_due;
-    DisDisplayTiming not_due_timing;
     EXPECT_FALSE(interpolator.TryGetDisplayFrame(
-        not_due, &not_due_timing));
+        not_due));
     const auto deadline =
         interpolator.GetNextDisplayDeadline();
     ASSERT_TRUE(deadline.has_value());
 
+    // Deliberately miss more than two nominal 20 ms deadlines. A single
+    // presentation call must consume exactly one frame, not catch up by
+    // silently skipping the overdue intermediates.
     std::this_thread::sleep_for(55ms);
-    cv::Mat latest_due;
+    cv::Mat first_intermediate;
     DisDisplayTiming timing;
     ASSERT_TRUE(interpolator.TryGetDisplayFrame(
-        latest_due, &timing));
-    EXPECT_FALSE(timing.latency_reset);
-    EXPECT_GE(timing.skipped_frames, 1U);
-    EXPECT_FALSE(latest_due.empty());
-    EXPECT_EQ(latest_due.type(), CV_8UC3);
+        first_intermediate, &timing));
+    EXPECT_TRUE(timing.starts_new_sequence);
+    EXPECT_FALSE(first_intermediate.empty());
+    EXPECT_EQ(first_intermediate.type(), CV_8UC3);
 
-    const DisQueueStats stats = interpolator.GetQueueStats();
+    DisQueueStats stats = interpolator.GetQueueStats();
+    EXPECT_EQ(stats.active_frames_remaining, 4U);
+    cv::Mat still_not_due;
+    EXPECT_FALSE(interpolator.TryGetDisplayFrame(still_not_due));
+
+    double previous_mean = cv::mean(first_intermediate)[0];
+    cv::Mat final_frame;
+    for (std::size_t frame_index = 1;
+         frame_index < 5;
+         ++frame_index) {
+        cv::Mat next_frame;
+        ASSERT_TRUE(WaitForDisplayFrame(interpolator, next_frame));
+        const double next_mean = cv::mean(next_frame)[0];
+        EXPECT_GT(next_mean, previous_mean);
+        previous_mean = next_mean;
+        final_frame = std::move(next_frame);
+    }
+
     EXPECT_EQ(
-        stats.skipped_display_frames,
-        timing.skipped_frames);
-    EXPECT_EQ(stats.latency_resets, 0U);
-}
-
-TEST(DisFrameInterpolatorTest, ExcessiveLagResetsToLatestRealFrame) {
-    DisInterpolationConfig config;
-    config.intermediate_frame_count = 4;
-    config.flow_scale = 1.0;
-    config.dis_preset = cv::DISOpticalFlow::PRESET_ULTRAFAST;
-    config.max_playback_lag = 20ms;
-    DisFrameInterpolator interpolator(config);
-
-    const auto first_arrival = std::chrono::steady_clock::now();
-    interpolator.SubmitFrame(
-        SolidFrame(24, 24, 10), first_arrival);
-
-    cv::Mat first;
-    ASSERT_TRUE(WaitForDisplayFrame(interpolator, first));
-
-    const cv::Mat second = SolidFrame(24, 24, 110);
-    interpolator.SubmitFrame(
-        second, first_arrival + 50ms);
-    ASSERT_TRUE(WaitUntil([&interpolator]() {
-        const DisQueueStats stats = interpolator.GetQueueStats();
-        return stats.ready_sequences == 1 && !stats.worker_busy;
-    }));
-
-    cv::Mat not_due;
-    EXPECT_FALSE(interpolator.TryGetDisplayFrame(not_due));
-    std::this_thread::sleep_for(45ms);
-
-    cv::Mat reset_frame;
-    DisDisplayTiming timing;
-    ASSERT_TRUE(interpolator.TryGetDisplayFrame(
-        reset_frame, &timing));
-    EXPECT_TRUE(timing.latency_reset);
-    EXPECT_GT(timing.lag_before_reset_ms, 20.0);
-    EXPECT_GT(timing.skipped_frames, 0U);
-    EXPECT_EQ(cv::norm(reset_frame, second, cv::NORM_INF), 0.0);
-
-    const DisQueueStats reset_stats =
-        interpolator.GetQueueStats();
-    EXPECT_EQ(reset_stats.latency_resets, 1U);
-    EXPECT_EQ(
-        reset_stats.skipped_display_frames,
-        timing.skipped_frames);
-    EXPECT_EQ(reset_stats.pending_pairs, 0U);
-    EXPECT_EQ(reset_stats.ready_sequences, 0U);
-    EXPECT_EQ(reset_stats.active_frames_remaining, 0U);
+        cv::norm(
+            final_frame,
+            SolidFrame(24, 24, 200),
+            cv::NORM_INF),
+        0.0);
+    stats = interpolator.GetQueueStats();
+    EXPECT_EQ(stats.active_frames_remaining, 0U);
     EXPECT_FALSE(
         interpolator.GetNextDisplayDeadline().has_value());
-
-    // The reset display copy must not alias the retained endpoint, which
-    // still seeds the next pair.
-    reset_frame.setTo(cv::Scalar(240, 240, 240));
-    interpolator.SubmitFrame(
-        SolidFrame(24, 24, 110),
-        first_arrival + 100ms);
-    cv::Mat recovered;
-    ASSERT_TRUE(WaitForDisplayFrame(interpolator, recovered));
-    EXPECT_NEAR(cv::mean(recovered)[0], 110.0, 1.0);
 }
 
 TEST(DisFrameInterpolatorTest, DisplayMutationDoesNotAlterRetainedEndpoint) {

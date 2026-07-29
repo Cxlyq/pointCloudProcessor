@@ -31,12 +31,13 @@ DIS 预设：ULTRAFAST
   - 仅在真实网格到达时渲染一次源画面，避免持续重绘阻塞插值播放。
 - `src/visualization/src/interpolation_display_node.cpp`
   - 在独立 ROS 2 进程的主线程创建和更新 HighGUI 窗口；
-  - 使用有界、best-effort 图像订阅，不在显示较慢时反压生成节点。
+  - ROS 接收线程与 HighGUI 主线程分离，使用 reliable DDS 和有界 FIFO 保序；
+  - 恢复 `startWindowThread()` 事件处理，后端不支持时才回退到 `waitKey()`。
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
   - 默认生成 4 张中间帧；
-  - 根据真实帧到达间隔调度中间帧，并只保留当前最新到期帧。
+  - 根据真实帧到达间隔调度中间帧，迟到时也逐帧播放而不跳过。
 - `src/visualization/config/v_dis_ultrafast_config.yaml`
   - 第一阶段独立参数。
 - `src/visualization/launch/v_dis_ultrafast.launch.py`
@@ -96,7 +97,7 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 | `interpolation_bidirectional_flow` | `false` | 保持阶段 1 的单向光流 |
 | `interpolation_flow_consistency_mask` | `false` | 仅双向流可用；阶段 1 保持关闭 |
 | `interpolation_timing_source` | `arrival` | 使用真实帧到达间隔计算播放步长 |
-| `interpolation_max_playback_lag_ms` | `1000` | 播放截止时间落后超过该值时跳到最新真实帧 |
+| `interpolation_display_queue_depth` | `10` | 显示进程 FIFO 深度；满时通过 reliable DDS 反压 |
 | `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
 | `interpolation_show_source_window` | `false` | 是否显示仅用于调试的 Open3D 源窗口 |
 
@@ -123,7 +124,7 @@ ros2 launch visualization v_vis.launch.py
 - 第二张真实网格到达后是否开始平滑播放；
 - `[GEN]` 是否显示生成 4 张中间显示帧及其总耗时；
 - `[TX]` 发布频率与 `[FPS] Display` 的 `received`、`presented` 是否一致；
-- `max display gap`、`missing`、`overwritten` 和 HighGUI 最大耗时是否解释体感；
+- `max display gap`、`missing`、FIFO 深度、反压次数和 HighGUI 最大耗时是否解释体感；
 - 实际显示帧数是否约为原始方式的 5 倍；
 - 轮廓是否出现明显双影、拉伸或反方向移动；
 - 光流计算期间 Open3D 和 ROS 是否仍能响应；
@@ -138,7 +139,7 @@ ros2 launch visualization v_vis.launch.py
 - 原始 `v_vis.launch.py` 不启用插帧，相机仅在第一帧设置，不受
   `interpolation_lock_camera` 影响；
 - 中间帧在后台预生成，计算完成前会保持上一张已显示画面。
-- 完整中间帧序列进入 ready 队列后才会唤醒输出调度线程；正常迟到只跳过已经过期的
-  显示帧，累计迟到超过 1 秒才重置到最新真实帧。
-- HighGUI 只在 `interpolation_display_node` 的主线程运行，避免 ROS 2/Linux 上 Qt
-  后端从工作线程创建窗口。
+- 完整中间帧序列进入 ready 队列后才会唤醒输出调度线程；显示迟到会拉长播放时间，
+  不会跳过已经生成的显示帧。
+- HighGUI 只在 `interpolation_display_node` 的主线程调用；ROS 回调在独立线程接收，
+  避免 `waitKey()` 阻塞时 DDS 只能保留最新一帧。

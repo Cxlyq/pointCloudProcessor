@@ -7,7 +7,6 @@
     interpolation_enabled: false
     interpolation_flow_consistency_mask: false
     interpolation_timing_source: "arrival"
-    interpolation_max_playback_lag_ms: 1000
     interpolation_lock_camera: false
     # 定义需要开启的窗口 ID 列表
     camera_ids: ["cam_front"]
