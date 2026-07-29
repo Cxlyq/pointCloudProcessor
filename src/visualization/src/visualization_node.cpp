@@ -18,6 +18,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "pc_msgs/msg/o3_d_mesh.hpp"
+#include "visualization/display_frame_sequence.hpp"
 #include "visualization/dis_frame_interpolator.hpp"
 #include "visualization/ros_image_conversion.hpp"
 
@@ -117,6 +118,7 @@ struct CamConfig {
     std::uint64_t last_reported_coalesced_source_frames = 0;
     std::uint64_t last_reported_skipped_display_frames = 0;
     std::uint64_t last_reported_latency_resets = 0;
+    std::uint64_t next_interpolated_frame_sequence = 1;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -826,6 +828,9 @@ private:
             pointcloud_visualization::BgrMatToImageMessage(
                 interpolated_frame);
         message.header.stamp = this->get_clock()->now();
+        message.header.frame_id =
+            pointcloud_visualization::EncodeDisplayFrameSequence(
+                item.next_interpolated_frame_sequence++);
         item.interpolation_frame_publisher->publish(message);
 
         RecordInterpolatedFrame(
@@ -883,19 +888,36 @@ private:
             item.last_reported_superseded_mesh_count;
         item.last_reported_superseded_mesh_count =
             superseded_mesh_total;
-        RCLCPP_INFO(
-            this->get_logger(),
-            "[FPS] Source \"%s\": %.2f FPS | %.1f s window | "
-            "max gap %.0f ms | superseded meshes +%llu "
-            "(total %llu).",
-            item.name.c_str(),
-            measured_fps,
-            elapsed_sec,
-            window.maximum_gap_ms,
-            static_cast<unsigned long long>(
-                superseded_mesh_delta),
-            static_cast<unsigned long long>(
-                superseded_mesh_total));
+        if (interpolation_enabled_) {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[SRC] Rendered \"%s\": %.2f FPS | %.1f s window | "
+                "max gap %.0f ms | superseded meshes +%llu "
+                "(total %llu).",
+                item.name.c_str(),
+                measured_fps,
+                elapsed_sec,
+                window.maximum_gap_ms,
+                static_cast<unsigned long long>(
+                    superseded_mesh_delta),
+                static_cast<unsigned long long>(
+                    superseded_mesh_total));
+        } else {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[FPS] Display \"%s\" (no interpolation): "
+                "presented %.2f FPS | %.1f s window | "
+                "max display gap %.0f ms | superseded meshes +%llu "
+                "(total %llu).",
+                item.name.c_str(),
+                measured_fps,
+                elapsed_sec,
+                window.maximum_gap_ms,
+                static_cast<unsigned long long>(
+                    superseded_mesh_delta),
+                static_cast<unsigned long long>(
+                    superseded_mesh_total));
+        }
 
         InitializeFpsWindow(window, now);
     }
@@ -967,8 +989,9 @@ private:
             queue_stats.latency_resets;
         RCLCPP_INFO(
             this->get_logger(),
-            "[FPS] Interpolated \"%s\": playback %.1f FPS | "
-            "effective %.1f FPS | %.1f s window | max gap %.0f ms | "
+            "[TX] Interpolated \"%s\": published playback %.1f FPS | "
+            "published effective %.1f FPS | %.1f s window | "
+            "max publish gap %.0f ms | "
             "coalesced +%llu (total %llu) | skipped +%llu "
             "(total %llu) | resets +%llu (total %llu) | queue %zu "
             "pending / %zu ready / %zu active | worker %s | "

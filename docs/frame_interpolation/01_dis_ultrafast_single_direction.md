@@ -122,7 +122,8 @@ ros2 launch visualization v_vis.launch.py
 - 日志是否显示 `Single-direction DIS interpolation enabled`；
 - 第二张真实网格到达后是否开始平滑播放；
 - `[GEN]` 是否显示生成 4 张中间显示帧及其总耗时；
-- `[FPS]` 中 `playback`、`effective` 和 `max gap` 是否符合体感；
+- `[TX]` 发布频率与 `[FPS] Display` 的 `received`、`presented` 是否一致；
+- `max display gap`、`missing`、`overwritten` 和 HighGUI 最大耗时是否解释体感；
 - 实际显示帧数是否约为原始方式的 5 倍；
 - 轮廓是否出现明显双影、拉伸或反方向移动；
 - 光流计算期间 Open3D 和 ROS 是否仍能响应；

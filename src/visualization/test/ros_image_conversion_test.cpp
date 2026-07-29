@@ -1,7 +1,9 @@
+#include "visualization/display_frame_sequence.hpp"
 #include "visualization/ros_image_conversion.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
@@ -11,6 +13,46 @@
 
 namespace pointcloud_visualization {
 namespace {
+
+TEST(DisplayFrameSequenceTest, RoundTripsSequenceNumbers) {
+    const std::uint64_t maximum_sequence =
+        std::numeric_limits<std::uint64_t>::max();
+
+    const auto zero_sequence =
+        DecodeDisplayFrameSequence(
+            EncodeDisplayFrameSequence(0));
+    ASSERT_TRUE(zero_sequence.has_value());
+    EXPECT_EQ(*zero_sequence, 0U);
+
+    const auto decoded_maximum_sequence =
+        DecodeDisplayFrameSequence(
+            EncodeDisplayFrameSequence(maximum_sequence));
+    ASSERT_TRUE(decoded_maximum_sequence.has_value());
+    EXPECT_EQ(
+        *decoded_maximum_sequence,
+        maximum_sequence);
+}
+
+TEST(DisplayFrameSequenceTest, RejectsMalformedFrameIds) {
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence("").has_value());
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence(
+            "visualization/display_sequence/").has_value());
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence(
+            "visualization/display_sequence/not-a-number").has_value());
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence(
+            "visualization/display_sequence/12suffix").has_value());
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence(
+            "visualization/display_sequence/"
+            "18446744073709551616").has_value());
+    EXPECT_FALSE(
+        DecodeDisplayFrameSequence(
+            "unrelated/12").has_value());
+}
 
 TEST(RosImageConversionTest, RoundTripsContinuousBgrFrame) {
     cv::Mat source(

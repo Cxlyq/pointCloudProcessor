@@ -100,22 +100,28 @@ fps_logging_interval_sec: 5.0
 原始可视化输出：
 
 ```text
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
+[FPS] Display "..." (no interpolation): presented 0.50 FPS | 6.0 s window | max display gap 2010 ms | superseded meshes +0 (total 3).
 ```
 
-这里统计的是完成新网格渲染的频率，不把没有新内容的 UI 空转计为新帧。
+这里统计的是 Open3D 完成新网格窗口更新的频率，不把没有新内容的 UI 空转计为新帧。
 
 插帧版本同时输出：
 
 ```text
 [GEN] Single-direction DIS: 19 intermediate display frames in 320.5 ms
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
-[FPS] Interpolated "...": playback 9.8 FPS | effective 8.7 FPS | 5.1 s window | max gap 410 ms | coalesced +1 (total 4) | skipped +0 (total 2) | resets +0 (total 0) | queue 1 pending / 0 ready / 6 active | worker busy | lag 12.3 ms.
+[SRC] Rendered "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
+[TX] Interpolated "...": published playback 9.8 FPS | published effective 8.7 FPS | 5.1 s window | max publish gap 410 ms | coalesced +1 (total 4) | skipped +0 (total 2) | resets +0 (total 0) | queue 1 pending / 0 ready / 6 active | worker busy | lag 12.3 ms.
+[FPS] Display "...": received 8.2 FPS (+41, total 82) | presented 6.0 FPS (+30, total 60) | 5.0 s window | max display gap 405 ms | HighGUI max imshow 1.2 ms / waitKey 280.0 ms | overwritten +11 (total 22) | missing +4 (total 8) | out-of-order +0 (total 0) | unsequenced +0 (total 0) | rejected +0 (total 0) | pending 0.
 ```
 
-- `playback FPS`：同一批中间帧连续发布时，根据实际发布间隔计算，更接近运动时的体感；
-- `effective FPS`：把批次间等待、计算和排队的停顿也计入，通常更低；
-- `max gap`：统计窗口内相邻输出帧的最大间隔，用于识别平均 FPS 掩盖的卡顿；
+- `[TX]` 只统计生成进程调用图像发布的频率，不代表窗口实际显示帧率；
+- `[FPS] Display` 的 `received` 是显示节点回调实际收到的帧率；
+- `presented` 在新帧完成 `imshow()` 和一次 `waitKey()` 事件处理后计数，是正式显示 FPS；
+- `max display gap` 是相邻 presented 帧的最大时间间隔；
+- `HighGUI max imshow / waitKey` 用于定位窗口后端是否阻塞显示消费；
+- `missing` 根据发布端写入图像消息头的单调编号统计，表示帧在发布后、显示回调前丢失；
+- `overwritten` 表示显示回调已经收到帧，但单帧 pending 缓存尚未消费就被下一帧覆盖；
+- `out-of-order / unsequenced / rejected` 分别表示乱序、缺少有效诊断编号和图像校验失败；
 - `+N (total M)`：`N` 是当前统计窗口新增次数，`M` 是进程启动后的累计次数；
 - `skipped`：输出调度线程迟到时被更新的到期帧，以及超出最大延迟后被清理的排队帧；
 - `resets`：播放延迟超过阈值并跳到最新真实帧的次数；
@@ -131,10 +137,10 @@ fps_logging_interval_sec: 5.0
 这里的 `lag` 是相对播放截止时间的调度迟到，不是“最新真实帧到达后经过了多久”；
 因此正常的低源帧率和允许的首段等待不会触发重置。
 
-OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此生成节点的插值 FPS
-测量点是 `sensor_msgs/Image` 完成发布的时刻，不等同于显示器扫描时刻。图像话题使用
-`KeepLast + best_effort` 的有界实时策略；显示节点在主线程回调中只保留每个窗口的最新
-消息。默认 INFO 日志主要保留 `[GEN]`、`[FPS]`、警告和错误。
+OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此 `presented` 的
+测量边界是应用完成 `imshow()` 和 `waitKey()`，不等同于显示器物理扫描时刻。诊断版本
+暂时保留 `KeepLast(1) + best_effort` 和单帧 pending 缓存，以便通过 `missing` 与
+`overwritten` 区分丢帧位置；增加统计本身不改变当前播放策略。
 
 ## 自动化验证
 

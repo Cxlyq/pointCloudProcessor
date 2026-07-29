@@ -1,9 +1,14 @@
+#include "visualization/display_frame_sequence.hpp"
 #include "visualization/ros_image_conversion.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +25,31 @@ namespace {
 constexpr char kInterpolatedFrameTopic[] = "interpolated_frames";
 constexpr auto kNoWindowPollInterval = std::chrono::milliseconds(5);
 
+struct DisplayStats {
+    bool window_initialized = false;
+    std::chrono::steady_clock::time_point window_started_at;
+    bool has_last_presented_frame = false;
+    std::chrono::steady_clock::time_point last_presented_at;
+    std::uint64_t window_received_frames = 0;
+    std::uint64_t window_presented_frames = 0;
+    std::uint64_t window_overwritten_frames = 0;
+    std::uint64_t window_missing_frames = 0;
+    std::uint64_t window_out_of_order_frames = 0;
+    std::uint64_t window_unsequenced_frames = 0;
+    std::uint64_t window_rejected_frames = 0;
+    std::uint64_t total_received_frames = 0;
+    std::uint64_t total_presented_frames = 0;
+    std::uint64_t total_overwritten_frames = 0;
+    std::uint64_t total_missing_frames = 0;
+    std::uint64_t total_out_of_order_frames = 0;
+    std::uint64_t total_unsequenced_frames = 0;
+    std::uint64_t total_rejected_frames = 0;
+    std::optional<std::uint64_t> last_received_sequence;
+    double maximum_display_gap_ms = 0.0;
+    double maximum_imshow_ms = 0.0;
+    double maximum_wait_key_ms = 0.0;
+};
+
 struct WindowState {
     std::string camera_id;
     std::string window_name;
@@ -28,6 +58,8 @@ struct WindowState {
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr
         subscription;
     bool created = false;
+    bool submitted_this_cycle = false;
+    DisplayStats stats;
 };
 
 class InterpolationDisplayNode : public rclcpp::Node {
@@ -45,6 +77,18 @@ public:
             this->declare_parameter<std::string>(
                 "interpolation_window_suffix",
                 " - DIS Interpolated");
+        fps_logging_enabled_ =
+            this->declare_parameter<bool>(
+                "fps_logging_enabled", true);
+        fps_logging_interval_sec_ =
+            this->declare_parameter<double>(
+                "fps_logging_interval_sec", 5.0);
+        if (fps_logging_enabled_ &&
+            (!std::isfinite(fps_logging_interval_sec_) ||
+             fps_logging_interval_sec_ <= 0.0)) {
+            throw std::invalid_argument(
+                "fps_logging_interval_sec must be greater than zero");
+        }
 
         windows_.reserve(camera_ids.size());
         std::unordered_set<std::string> unique_camera_ids;
@@ -96,8 +140,12 @@ public:
                         if (message == nullptr) {
                             return;
                         }
-                        windows_.at(index).pending_frame =
-                            std::move(message);
+                        WindowState& state = windows_.at(index);
+                        RecordReceivedFrame(
+                            state,
+                            *message,
+                            std::chrono::steady_clock::now());
+                        state.pending_frame = std::move(message);
                     });
 
             RCLCPP_INFO(
@@ -110,6 +158,13 @@ public:
         RCLCPP_INFO(
             this->get_logger(),
             "[*] All HighGUI calls run on this process's main thread.");
+        if (fps_logging_enabled_) {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[FPS] Display-side logging enabled with a %.1f s "
+                "measurement window.",
+                fps_logging_interval_sec_);
+        }
     }
 
     ~InterpolationDisplayNode() override {
@@ -119,6 +174,7 @@ public:
     bool PresentReadyFramesAndProcessEvents() {
         bool has_created_window = false;
         for (auto& state : windows_) {
+            state.submitted_this_cycle = false;
             if (state.pending_frame == nullptr) {
                 has_created_window =
                     has_created_window || state.created;
@@ -144,8 +200,19 @@ public:
                         frame.cols,
                         frame.rows);
                 }
+                const auto imshow_started_at =
+                    std::chrono::steady_clock::now();
                 cv::imshow(state.window_name, frame);
+                const auto imshow_finished_at =
+                    std::chrono::steady_clock::now();
+                state.stats.maximum_imshow_ms = std::max(
+                    state.stats.maximum_imshow_ms,
+                    std::chrono::duration<double, std::milli>(
+                        imshow_finished_at -
+                        imshow_started_at).count());
+                state.submitted_this_cycle = true;
             } catch (const std::exception& error) {
+                RecordRejectedFrame(state);
                 RCLCPP_ERROR(
                     this->get_logger(),
                     "[!] Rejected interpolated frame for \"%s\": %s",
@@ -161,10 +228,35 @@ public:
             // HighGUI window exists, so explicitly throttle the no-frame
             // startup path.
             std::this_thread::sleep_for(kNoWindowPollInterval);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& state : windows_) {
+                ReportDisplayStatsIfDue(state, now);
+            }
             return true;
         }
 
+        const auto wait_key_started_at =
+            std::chrono::steady_clock::now();
         const int key = cv::waitKey(1);
+        const auto wait_key_finished_at =
+            std::chrono::steady_clock::now();
+        const double wait_key_ms =
+            std::chrono::duration<double, std::milli>(
+                wait_key_finished_at -
+                wait_key_started_at).count();
+        for (auto& state : windows_) {
+            if (state.created) {
+                state.stats.maximum_wait_key_ms = std::max(
+                    state.stats.maximum_wait_key_ms,
+                    wait_key_ms);
+            }
+            if (state.submitted_this_cycle) {
+                RecordPresentedFrame(
+                    state, wait_key_finished_at);
+            }
+            ReportDisplayStatsIfDue(
+                state, wait_key_finished_at);
+        }
         return key != 27 && key != 'q' && key != 'Q';
     }
 
@@ -194,7 +286,181 @@ public:
     }
 
 private:
+    void InitializeStatsWindow(
+        DisplayStats& stats,
+        std::chrono::steady_clock::time_point now) {
+        stats.window_initialized = true;
+        stats.window_started_at = now;
+    }
+
+    void RecordReceivedFrame(
+        WindowState& state,
+        const sensor_msgs::msg::Image& message,
+        std::chrono::steady_clock::time_point now) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+
+        DisplayStats& stats = state.stats;
+        if (!stats.window_initialized) {
+            InitializeStatsWindow(stats, now);
+        }
+        ++stats.window_received_frames;
+        ++stats.total_received_frames;
+
+        if (state.pending_frame != nullptr) {
+            ++stats.window_overwritten_frames;
+            ++stats.total_overwritten_frames;
+        }
+
+        const auto sequence =
+            pointcloud_visualization::
+                DecodeDisplayFrameSequence(
+                    message.header.frame_id);
+        if (!sequence.has_value()) {
+            ++stats.window_unsequenced_frames;
+            ++stats.total_unsequenced_frames;
+            return;
+        }
+        if (!stats.last_received_sequence.has_value()) {
+            stats.last_received_sequence = *sequence;
+            return;
+        }
+
+        const std::uint64_t previous_sequence =
+            *stats.last_received_sequence;
+        if (*sequence > previous_sequence) {
+            const std::uint64_t missing_frames =
+                *sequence - previous_sequence - 1;
+            stats.window_missing_frames += missing_frames;
+            stats.total_missing_frames += missing_frames;
+            stats.last_received_sequence = *sequence;
+        } else {
+            ++stats.window_out_of_order_frames;
+            ++stats.total_out_of_order_frames;
+        }
+    }
+
+    void RecordRejectedFrame(WindowState& state) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+        ++state.stats.window_rejected_frames;
+        ++state.stats.total_rejected_frames;
+    }
+
+    void RecordPresentedFrame(
+        WindowState& state,
+        std::chrono::steady_clock::time_point now) {
+        if (!fps_logging_enabled_) {
+            return;
+        }
+
+        DisplayStats& stats = state.stats;
+        if (!stats.window_initialized) {
+            InitializeStatsWindow(stats, now);
+        }
+        if (stats.has_last_presented_frame) {
+            const double display_gap_ms =
+                std::chrono::duration<double, std::milli>(
+                    now - stats.last_presented_at).count();
+            stats.maximum_display_gap_ms = std::max(
+                stats.maximum_display_gap_ms,
+                display_gap_ms);
+        }
+        stats.has_last_presented_frame = true;
+        stats.last_presented_at = now;
+        ++stats.window_presented_frames;
+        ++stats.total_presented_frames;
+    }
+
+    void ReportDisplayStatsIfDue(
+        WindowState& state,
+        std::chrono::steady_clock::time_point now) {
+        if (!fps_logging_enabled_ ||
+            !state.stats.window_initialized) {
+            return;
+        }
+
+        DisplayStats& stats = state.stats;
+        const double elapsed_sec =
+            std::chrono::duration<double>(
+                now - stats.window_started_at).count();
+        if (elapsed_sec < fps_logging_interval_sec_) {
+            return;
+        }
+
+        const double received_fps =
+            static_cast<double>(
+                stats.window_received_frames) /
+            elapsed_sec;
+        const double presented_fps =
+            static_cast<double>(
+                stats.window_presented_frames) /
+            elapsed_sec;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "[FPS] Display \"%s\": received %.1f FPS "
+            "(+%llu, total %llu) | presented %.1f FPS "
+            "(+%llu, total %llu) | %.1f s window | "
+            "max display gap %.0f ms | HighGUI max imshow %.1f ms / "
+            "waitKey %.1f ms | overwritten +%llu (total %llu) | "
+            "missing +%llu (total %llu) | out-of-order +%llu "
+            "(total %llu) | unsequenced +%llu (total %llu) | "
+            "rejected +%llu (total %llu) | pending %d.",
+            state.window_name.c_str(),
+            received_fps,
+            static_cast<unsigned long long>(
+                stats.window_received_frames),
+            static_cast<unsigned long long>(
+                stats.total_received_frames),
+            presented_fps,
+            static_cast<unsigned long long>(
+                stats.window_presented_frames),
+            static_cast<unsigned long long>(
+                stats.total_presented_frames),
+            elapsed_sec,
+            stats.maximum_display_gap_ms,
+            stats.maximum_imshow_ms,
+            stats.maximum_wait_key_ms,
+            static_cast<unsigned long long>(
+                stats.window_overwritten_frames),
+            static_cast<unsigned long long>(
+                stats.total_overwritten_frames),
+            static_cast<unsigned long long>(
+                stats.window_missing_frames),
+            static_cast<unsigned long long>(
+                stats.total_missing_frames),
+            static_cast<unsigned long long>(
+                stats.window_out_of_order_frames),
+            static_cast<unsigned long long>(
+                stats.total_out_of_order_frames),
+            static_cast<unsigned long long>(
+                stats.window_unsequenced_frames),
+            static_cast<unsigned long long>(
+                stats.total_unsequenced_frames),
+            static_cast<unsigned long long>(
+                stats.window_rejected_frames),
+            static_cast<unsigned long long>(
+                stats.total_rejected_frames),
+            state.pending_frame != nullptr ? 1 : 0);
+
+        stats.window_started_at = now;
+        stats.window_received_frames = 0;
+        stats.window_presented_frames = 0;
+        stats.window_overwritten_frames = 0;
+        stats.window_missing_frames = 0;
+        stats.window_out_of_order_frames = 0;
+        stats.window_unsequenced_frames = 0;
+        stats.window_rejected_frames = 0;
+        stats.maximum_display_gap_ms = 0.0;
+        stats.maximum_imshow_ms = 0.0;
+        stats.maximum_wait_key_ms = 0.0;
+    }
+
     std::vector<WindowState> windows_;
+    bool fps_logging_enabled_ = true;
+    double fps_logging_interval_sec_ = 5.0;
 };
 
 }  // namespace
