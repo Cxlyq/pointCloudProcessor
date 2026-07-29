@@ -86,6 +86,17 @@ fps_logging_enabled: true
 fps_logging_interval_sec: 5.0
 ```
 
+插帧窗口默认自动选择显示后端：
+
+```yaml
+interpolation_display_backend: "auto"
+```
+
+Windows 下 `auto` 使用同进程、同 UI 线程的原生 GDI 窗口，绕过可能长时间阻塞的
+OpenCV HighGUI；其他平台自动回退到 HighGUI。可将参数显式设为 `highgui` 做对照。
+原生窗口同步完成当前帧绘制，不创建独立 DDS 显示节点，也不使用“只保留最新显示帧”的
+后台线程。
+
 日志按处理阶段拆分：
 
 - `[RX]`：ROS 回调实际接收 Mesh 的帧率、回调构建 Mesh 的耗时和交接前被覆盖的帧数；
@@ -93,9 +104,9 @@ fps_logging_interval_sec: 5.0
 - `[SOURCE]`：插帧模式下，成功完成 Open3D 渲染和截图的真实帧率；
 - `[RENDER]`：等待、窗口事件、Geometry 更新、渲染截图、格式转换、校验和提交的平均/最大耗时；
 - `[GEN]`：DIS 序列号、两端真实帧编号、端点跨度、合并数、中间帧数和计算耗时；
-- `[DISPLAY]`：`imshow()` 提交帧率、批内播放帧率、最大间隔、调用耗时、调度逾期和顺序错误；
+- `[DISPLAY]`：实际显示后端、提交帧率、批内播放帧率、最大间隔、绘制耗时、调度逾期和顺序错误；
 - `[PIPE]`：最近提交的序列/帧编号以及 pending、ready、active、worker 和累计合并状态；
-- `[HIGHGUI]`：仅在 `startWindowThread()` 不可用时统计 `waitKey()` 事件泵耗时。
+- `[DISPLAY-EVENT]`：原生窗口或 HighGUI `waitKey()` 的事件泵耗时。
 
 典型插帧日志如下：
 
@@ -103,11 +114,11 @@ fps_logging_interval_sec: 5.0
 [RX] Accepted mesh: 1.96 FPS | 5.1 s window | max gap 530 ms | callback avg/max 18.0/24.0 ms
 [RENDER] "...": 10 source frames | age avg/max 12.0/35.0 ms | geometry 20.0/31.0 | capture 85.0/122.0 ms
 [GEN] Bidirectional DIS: sequence 12 source 12->13 | span 505.0 ms | coalesced 0 | 4 intermediate display frames in 75.0 ms
-[DISPLAY] "...": imshow-submit 9.5 FPS | playback 9.7 FPS | max gap 135 ms | imshow avg/max 2.0/8.0 ms
+[DISPLAY] "...": backend native-win32 | submit 9.5 FPS | playback 9.7 FPS | max gap 135 ms | present avg/max 2.0/8.0 ms
 [PIPE] Last S12 5/5 source 12->13 | queue 0 pending / 0 ready / 0 active | worker idle
 ```
 
-`DISPLAY` 统计的是程序成功完成 `imshow()` 调用的提交边界。OpenCV HighGUI 没有跨平台的
+`DISPLAY` 统计的是程序成功完成所选显示后端绘制调用的边界。操作系统合成器没有提供统一的
 “显示器已经扫描并呈现此帧”回调，因此它不能单独证明物理屏幕刷新了每一张图。短时间核对
 物理刷新时，可以把对应插帧配置中的以下参数改成 `true`：
 

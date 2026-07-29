@@ -17,6 +17,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "pc_msgs/msg/o3_d_mesh.hpp"
 #include "visualization/dis_frame_interpolator.hpp"
+#include "visualization/native_frame_window.hpp"
 
 // 引入 Open3D 核心与可视化头文件
 #include "open3d/Open3D.h"
@@ -155,7 +156,7 @@ struct RawDisplayDiagnostics {
 };
 
 struct InterpolationDisplayDiagnostics {
-    TimingAccumulator imshow;
+    TimingAccumulator presentation;
     TimingAccumulator scheduled_lateness;
     TimingAccumulator source_end_age;
     bool order_initialized = false;
@@ -176,7 +177,7 @@ struct RxDiagnostics {
     std::uint64_t superseded_window = 0;
 };
 
-struct HighGuiDiagnostics {
+struct DisplayEventDiagnostics {
     bool initialized = false;
     std::chrono::steady_clock::time_point window_started_at;
     TimingAccumulator event_processing;
@@ -198,6 +199,8 @@ struct CamConfig {
     std::shared_ptr<open3d::geometry::TriangleMesh> interpolation_render_mesh;
     std::string interpolation_window_name;
     std::unique_ptr<pointcloud_visualization::DisFrameInterpolator> interpolator;
+    std::unique_ptr<pointcloud_visualization::NativeFrameWindow>
+        native_interpolation_window;
     cv::Mat displayed_interpolated_frame;
     FpsWindow source_fps;
     FpsWindow interpolation_fps;
@@ -206,6 +209,7 @@ struct CamConfig {
     InterpolationDisplayDiagnostics
         interpolation_display_diagnostics;
     std::uint64_t source_last_reported_superseded = 0;
+    bool display_failure_reported = false;
 };
 
 class VisualizationNode : public rclcpp::Node {
@@ -225,6 +229,8 @@ public:
             "interpolation_timing_source", "arrival");
         this->declare_parameter<bool>("interpolation_lock_camera", false);
         this->declare_parameter<bool>("interpolation_show_source_window", false);
+        this->declare_parameter<std::string>(
+            "interpolation_display_backend", "auto");
         this->declare_parameter<bool>(
             "interpolation_diagnostic_overlay", false);
         this->declare_parameter<std::string>(
@@ -266,6 +272,9 @@ public:
             this->get_parameter("interpolation_lock_camera").as_bool();
         interpolation_show_source_window_ =
             this->get_parameter("interpolation_show_source_window").as_bool();
+        interpolation_display_backend_requested_ =
+            this->get_parameter(
+                "interpolation_display_backend").as_string();
         interpolation_diagnostic_overlay_ =
             this->get_parameter(
                 "interpolation_diagnostic_overlay").as_bool();
@@ -298,6 +307,38 @@ public:
             }
             interpolation_dis_preset_ =
                 parse_dis_preset(interpolation_dis_preset_name_);
+            std::transform(
+                interpolation_display_backend_requested_.begin(),
+                interpolation_display_backend_requested_.end(),
+                interpolation_display_backend_requested_.begin(),
+                [](unsigned char character) {
+                    return static_cast<char>(
+                        std::tolower(character));
+                });
+            if (interpolation_display_backend_requested_ == "auto") {
+                interpolation_use_native_display_ =
+                    pointcloud_visualization::NativeFrameWindow::
+                        IsSupported();
+            } else if (
+                interpolation_display_backend_requested_ == "native") {
+                if (!pointcloud_visualization::NativeFrameWindow::
+                        IsSupported()) {
+                    throw std::invalid_argument(
+                        "interpolation_display_backend=native is "
+                        "not supported on this platform");
+                }
+                interpolation_use_native_display_ = true;
+            } else if (
+                interpolation_display_backend_requested_ == "highgui") {
+                interpolation_use_native_display_ = false;
+            } else {
+                throw std::invalid_argument(
+                    "interpolation_display_backend must be auto, "
+                    "native, or highgui");
+            }
+            interpolation_display_backend_resolved_ =
+                interpolation_use_native_display_ ?
+                    "native-win32" : "highgui";
             std::transform(
                 interpolation_timing_source_.begin(),
                 interpolation_timing_source_.end(),
@@ -449,16 +490,37 @@ public:
                         pointcloud_visualization::DisFrameInterpolator>(
                         interpolation_config);
 
-                cv::namedWindow(
-                    cfg.interpolation_window_name, cv::WINDOW_NORMAL);
-                cv::resizeWindow(
-                    cfg.interpolation_window_name, cfg.width, cfg.height);
+                if (interpolation_use_native_display_) {
+                    cfg.native_interpolation_window =
+                        std::make_unique<
+                            pointcloud_visualization::
+                                NativeFrameWindow>();
+                    if (!cfg.native_interpolation_window->Create(
+                            cfg.interpolation_window_name,
+                            cfg.width,
+                            cfg.height)) {
+                        throw std::runtime_error(
+                            "failed to create native interpolation "
+                            "window: " +
+                            cfg.native_interpolation_window->
+                                LastError());
+                    }
+                } else {
+                    cv::namedWindow(
+                        cfg.interpolation_window_name,
+                        cv::WINDOW_NORMAL);
+                    cv::resizeWindow(
+                        cfg.interpolation_window_name,
+                        cfg.width,
+                        cfg.height);
+                }
             }
 
             visualizers_.push_back(std::move(cfg));
         }
 
-        if (interpolation_enabled_) {
+        if (interpolation_enabled_ &&
+            !interpolation_use_native_display_) {
             highgui_window_thread_started_ =
                 cv::startWindowThread() > 0;
         }
@@ -479,8 +541,8 @@ public:
             RCLCPP_INFO(
                 this->get_logger(),
                 "[DIAG] Stage timing enabled. DISPLAY counts successful "
-                "imshow submissions; physical monitor refresh is verified "
-                "separately with the optional frame overlay.");
+                "display-backend submissions; physical monitor refresh "
+                "is verified separately with the optional frame overlay.");
         }
         if (interpolation_enabled_) {
             RCLCPP_INFO(
@@ -500,6 +562,12 @@ public:
                 interpolation_timing_source_.c_str());
             RCLCPP_INFO(
                 this->get_logger(),
+                "[*] Interpolation display backend: %s "
+                "(requested %s).",
+                interpolation_display_backend_resolved_.c_str(),
+                interpolation_display_backend_requested_.c_str());
+            RCLCPP_INFO(
+                this->get_logger(),
                 "[DIAG] Interpolation frame overlay is %s.",
                 interpolation_diagnostic_overlay_ ?
                     "enabled" : "disabled");
@@ -508,11 +576,14 @@ public:
                 "[*] Source render window is %s; only the interpolated "
                 "window is intended for normal viewing.",
                 interpolation_show_source_window_ ? "visible" : "hidden");
-            RCLCPP_DEBUG(
-                this->get_logger(),
-                "[*] OpenCV HighGUI event thread is %s.",
-                highgui_window_thread_started_ ?
-                    "enabled" : "not available; using waitKey fallback");
+            if (!interpolation_use_native_display_) {
+                RCLCPP_DEBUG(
+                    this->get_logger(),
+                    "[*] OpenCV HighGUI event thread is %s.",
+                    highgui_window_thread_started_ ?
+                        "enabled" :
+                        "not available; using waitKey fallback");
+            }
         }
     }
 
@@ -538,14 +609,14 @@ public:
         // 遍历更新所有渲染窗口
         // Present every due interpolation frame before any Open3D source
         // rendering. A slow source capture must not delay another camera's
-        // already-ready HighGUI frame.
+        // already-ready display frame.
         if (interpolation_enabled_) {
             for (auto& item : visualizers_) {
                 if (item.interpolator != nullptr) {
                     ShowReadyInterpolatedFrame(item);
                 }
             }
-            ProcessHighGuiEvents();
+            ProcessDisplayEvents();
         }
 
         for (auto& item : visualizers_) {
@@ -768,14 +839,16 @@ public:
                     ShowReadyInterpolatedFrame(item);
                 }
             }
-            ProcessHighGuiEvents();
+            ProcessDisplayEvents();
         }
     }
 
     void cleanup() {
         for (auto& item : visualizers_) {
             item.interpolator.reset();
-            if (!item.interpolation_window_name.empty()) {
+            if (item.native_interpolation_window != nullptr) {
+                item.native_interpolation_window->Destroy();
+            } else if (!item.interpolation_window_name.empty()) {
                 cv::destroyWindow(item.interpolation_window_name);
             }
             item.vis->DestroyVisualizerWindow();
@@ -783,14 +856,23 @@ public:
     }
 
 private:
-    void ProcessHighGuiEvents() {
-        if (highgui_window_thread_started_) {
+    void ProcessDisplayEvents() {
+        if (!interpolation_use_native_display_ &&
+            highgui_window_thread_started_) {
             return;
         }
 
         const auto event_processing_started_at =
             std::chrono::steady_clock::now();
-        cv::waitKey(1);
+        if (interpolation_use_native_display_) {
+            for (auto& item : visualizers_) {
+                if (item.native_interpolation_window != nullptr) {
+                    item.native_interpolation_window->PollEvents();
+                }
+            }
+        } else {
+            cv::waitKey(1);
+        }
         const auto event_processing_finished_at =
             std::chrono::steady_clock::now();
         const double event_processing_ms =
@@ -798,41 +880,43 @@ private:
                 event_processing_started_at,
                 event_processing_finished_at);
         if (fps_logging_enabled_) {
-            if (!highgui_diagnostics_.initialized) {
-                highgui_diagnostics_.initialized = true;
-                highgui_diagnostics_.window_started_at =
+            DisplayEventDiagnostics& diagnostics =
+                display_event_diagnostics_;
+            if (!diagnostics.initialized) {
+                diagnostics.initialized = true;
+                diagnostics.window_started_at =
                     event_processing_finished_at;
             }
-            highgui_diagnostics_.event_processing.Add(
-                event_processing_ms);
+            diagnostics.event_processing.Add(event_processing_ms);
             const double elapsed_sec =
                 std::chrono::duration<double>(
                     event_processing_finished_at -
-                    highgui_diagnostics_.window_started_at).count();
+                    diagnostics.window_started_at).count();
             if (elapsed_sec >= fps_logging_interval_sec_) {
                 RCLCPP_INFO(
                     this->get_logger(),
-                    "[HIGHGUI] waitKey event pump: %zu calls | "
+                    "[DISPLAY-EVENT] %s event pump: %zu calls | "
                     "avg %.1f ms | max %.1f ms | %.1f s window.",
-                    highgui_diagnostics_.event_processing.sample_count,
-                    highgui_diagnostics_.event_processing.Average(),
-                    highgui_diagnostics_.event_processing.maximum_ms,
+                    interpolation_display_backend_resolved_.c_str(),
+                    diagnostics.event_processing.sample_count,
+                    diagnostics.event_processing.Average(),
+                    diagnostics.event_processing.maximum_ms,
                     elapsed_sec);
-                highgui_diagnostics_.event_processing.Reset();
-                highgui_diagnostics_.window_started_at =
+                diagnostics.event_processing.Reset();
+                diagnostics.window_started_at =
                     event_processing_finished_at;
             }
         }
         if (event_processing_ms > 100.0 &&
             event_processing_finished_at -
-                last_highgui_slow_warning_at_ >
+                last_display_event_slow_warning_at_ >
                 std::chrono::seconds(2)) {
             RCLCPP_WARN(
                 this->get_logger(),
-                "[?] OpenCV waitKey blocked for %.1f ms; "
-                "the GUI/X11 path is limiting image presentation.",
+                "[?] %s display event pump blocked for %.1f ms.",
+                interpolation_display_backend_resolved_.c_str(),
                 event_processing_ms);
-            last_highgui_slow_warning_at_ =
+            last_display_event_slow_warning_at_ =
                 event_processing_finished_at;
         }
     }
@@ -874,18 +958,53 @@ private:
             item.displayed_interpolated_frame =
                 std::move(interpolated_frame);
         }
-        const auto imshow_started_at =
+        const auto presentation_started_at =
             std::chrono::steady_clock::now();
-        cv::imshow(
-            item.interpolation_window_name,
-            item.displayed_interpolated_frame);
-        const auto imshow_finished_at =
+        bool presentation_succeeded = true;
+        if (item.native_interpolation_window != nullptr) {
+            presentation_succeeded =
+                item.native_interpolation_window->Present(
+                    item.displayed_interpolated_frame);
+        } else {
+            cv::imshow(
+                item.interpolation_window_name,
+                item.displayed_interpolated_frame);
+        }
+        const auto presentation_finished_at =
             std::chrono::steady_clock::now();
+        if (!presentation_succeeded) {
+            if (!item.display_failure_reported) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[!] %s display presentation failed: %s",
+                    interpolation_display_backend_resolved_.c_str(),
+                    item.native_interpolation_window->
+                        LastError().c_str());
+                item.display_failure_reported = true;
+            }
+            return;
+        }
+        item.display_failure_reported = false;
+        const double presentation_ms = elapsed_ms(
+            presentation_started_at,
+            presentation_finished_at);
+        if (presentation_ms > 100.0 &&
+            presentation_finished_at -
+                last_display_presentation_slow_warning_at_ >
+                std::chrono::seconds(2)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "[?] %s frame presentation blocked for %.1f ms.",
+                interpolation_display_backend_resolved_.c_str(),
+                presentation_ms);
+            last_display_presentation_slow_warning_at_ =
+                presentation_finished_at;
+        }
         RecordInterpolatedFrame(
             item,
-            imshow_finished_at,
+            presentation_finished_at,
             timing,
-            elapsed_ms(imshow_started_at, imshow_finished_at));
+            presentation_ms);
     }
 
     void InitializeFpsWindow(
@@ -1101,14 +1220,14 @@ private:
         CamConfig& item,
         std::chrono::steady_clock::time_point now,
         const pointcloud_visualization::DisDisplayTiming& timing,
-        double imshow_ms) {
+        double presentation_ms) {
         if (!fps_logging_enabled_) {
             return;
         }
 
         InterpolationDisplayDiagnostics& diagnostics =
             item.interpolation_display_diagnostics;
-        diagnostics.imshow.Add(imshow_ms);
+        diagnostics.presentation.Add(presentation_ms);
         diagnostics.scheduled_lateness.Add(
             timing.scheduled_lateness_ms);
         diagnostics.source_end_age.Add(
@@ -1188,18 +1307,19 @@ private:
             queue_stats.coalesced_source_frames;
         RCLCPP_INFO(
             this->get_logger(),
-            "[DISPLAY] \"%s\": imshow-submit %.1f FPS | playback "
-            "%.1f FPS | %.1f s window | max gap %.0f ms | imshow "
-            "avg/max %.1f/%.1f ms | scheduled late avg/max "
+            "[DISPLAY] \"%s\": backend %s | submit %.1f FPS | "
+            "playback %.1f FPS | %.1f s window | max gap %.0f ms | "
+            "present avg/max %.1f/%.1f ms | scheduled late avg/max "
             "%.1f/%.1f ms | endpoint age avg/max %.1f/%.1f ms | "
             "sequences +%llu | order errors +%llu (total %llu).",
             item.interpolation_window_name.c_str(),
+            interpolation_display_backend_resolved_.c_str(),
             effective_fps,
             playback_fps,
             elapsed_sec,
             window.maximum_gap_ms,
-            diagnostics.imshow.Average(),
-            diagnostics.imshow.maximum_ms,
+            diagnostics.presentation.Average(),
+            diagnostics.presentation.maximum_ms,
             diagnostics.scheduled_lateness.Average(),
             diagnostics.scheduled_lateness.maximum_ms,
             diagnostics.source_end_age.Average(),
@@ -1235,7 +1355,7 @@ private:
             static_cast<unsigned long long>(
                 queue_stats.coalesced_source_frames));
 
-        diagnostics.imshow.Reset();
+        diagnostics.presentation.Reset();
         diagnostics.scheduled_lateness.Reset();
         diagnostics.source_end_age.Reset();
         diagnostics.order_errors_window = 0;
@@ -1469,13 +1589,18 @@ private:
     bool interpolation_use_message_timestamps_ = false;
     bool interpolation_lock_camera_ = false;
     bool interpolation_show_source_window_ = false;
+    std::string interpolation_display_backend_requested_ = "auto";
+    std::string interpolation_display_backend_resolved_ = "highgui";
+    bool interpolation_use_native_display_ = false;
     bool interpolation_diagnostic_overlay_ = false;
     std::string interpolation_window_suffix_ = " - DIS Interpolated";
     bool highgui_window_thread_started_ = false;
     std::chrono::steady_clock::time_point
-        last_highgui_slow_warning_at_;
+        last_display_event_slow_warning_at_;
+    std::chrono::steady_clock::time_point
+        last_display_presentation_slow_warning_at_;
     RxDiagnostics rx_diagnostics_;
-    HighGuiDiagnostics highgui_diagnostics_;
+    DisplayEventDiagnostics display_event_diagnostics_;
 
     // 线程同步
     std::mutex mutex_;

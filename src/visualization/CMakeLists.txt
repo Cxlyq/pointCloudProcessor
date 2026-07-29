@@ -19,6 +19,7 @@ find_package(Open3D REQUIRED)
 add_executable(visualization_node
         src/visualization_node.cpp
         src/dis_frame_interpolator.cpp
+        src/native_frame_window.cpp
 )
 
 target_include_directories(visualization_node PUBLIC
@@ -34,6 +35,12 @@ target_link_libraries(visualization_node
         ${OpenCV_LIBS}
         Threads::Threads
 )
+if(WIN32)
+  target_link_libraries(visualization_node
+          user32
+          gdi32
+  )
+endif()
 target_compile_features(visualization_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 ament_target_dependencies(
   visualization_node
