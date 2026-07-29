@@ -77,37 +77,43 @@ ros2 launch visualization v_dis_quality_x20.launch.py
 
 不要同时启动多个可视化 launch；需要比较时，先停止当前可视化节点再切换。
 
-## FPS 统计与日志
+## FPS 统计与诊断日志
 
-所有版本默认开启 FPS 日志，统计窗口为 5 秒：
+所有版本默认开启诊断日志，统计窗口为 5 秒：
 
 ```yaml
 fps_logging_enabled: true
 fps_logging_interval_sec: 5.0
 ```
 
-原始可视化输出：
+日志按处理阶段拆分：
+
+- `[RX]`：ROS 回调实际接收 Mesh 的帧率、回调构建 Mesh 的耗时和交接前被覆盖的帧数；
+- `[DISPLAY-RAW]`：不插帧模式下，新内容到达 Open3D 显示边界的帧率及各阶段耗时；
+- `[SOURCE]`：插帧模式下，成功完成 Open3D 渲染和截图的真实帧率；
+- `[RENDER]`：等待、窗口事件、Geometry 更新、渲染截图、格式转换、校验和提交的平均/最大耗时；
+- `[GEN]`：DIS 序列号、两端真实帧编号、端点跨度、合并数、中间帧数和计算耗时；
+- `[DISPLAY]`：`imshow()` 提交帧率、批内播放帧率、最大间隔、调用耗时、调度逾期和顺序错误；
+- `[PIPE]`：最近提交的序列/帧编号以及 pending、ready、active、worker 和累计合并状态；
+- `[HIGHGUI]`：仅在 `startWindowThread()` 不可用时统计 `waitKey()` 事件泵耗时。
+
+典型插帧日志如下：
 
 ```text
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
+[RX] Accepted mesh: 1.96 FPS | 5.1 s window | max gap 530 ms | callback avg/max 18.0/24.0 ms
+[RENDER] "...": 10 source frames | age avg/max 12.0/35.0 ms | geometry 20.0/31.0 | capture 85.0/122.0 ms
+[GEN] Bidirectional DIS: sequence 12 source 12->13 | span 505.0 ms | coalesced 0 | 4 intermediate display frames in 75.0 ms
+[DISPLAY] "...": imshow-submit 9.5 FPS | playback 9.7 FPS | max gap 135 ms | imshow avg/max 2.0/8.0 ms
+[PIPE] Last S12 5/5 source 12->13 | queue 0 pending / 0 ready / 0 active | worker idle
 ```
 
-这里统计的是完成新网格渲染的频率，不把没有新内容的 UI 空转计为新帧。
+`DISPLAY` 统计的是程序成功完成 `imshow()` 调用的提交边界。OpenCV HighGUI 没有跨平台的
+“显示器已经扫描并呈现此帧”回调，因此它不能单独证明物理屏幕刷新了每一张图。短时间核对
+物理刷新时，可以把对应插帧配置中的以下参数改成 `true`：
 
-插帧版本同时输出：
-
-```text
-[GEN] Single-direction DIS: 19 intermediate display frames in 320.5 ms
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
-[FPS] Interpolated "...": playback 9.8 FPS | effective 8.7 FPS | 5.1 s window | max gap 410 ms.
+```yaml
+interpolation_diagnostic_overlay: true
 ```
 
-- `playback FPS`：同一批中间帧连续播放时，根据实际提交间隔计算，更接近运动时的体感；
-- `effective FPS`：把批次间等待、计算和排队的停顿也计入，通常更低；
-- `max gap`：统计窗口内相邻输出帧的最大间隔，用于识别平均 FPS 掩盖的卡顿；
-- `[GEN]`：每对真实帧生成的中间显示帧数量和总耗时。
-
-OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此插值 FPS 的测量点是
-`imshow()` 完成提交的时刻。相比旧统计，新统计不再因两秒空档重置，并把批内播放速度
-与包含停顿的长期有效速度分开报告。源网格渲染耗时和 HighGUI 后端信息已降为 DEBUG，
-默认 INFO 日志主要保留 `[GEN]`、`[FPS]`、警告和错误。
+画面左上角将显示 `S<序列号> <当前帧>/<总帧数>`。角标只应在短时验证时启用，因为复制和
+绘制角标本身会产生少量额外开销；正式性能测试保持 `false`。

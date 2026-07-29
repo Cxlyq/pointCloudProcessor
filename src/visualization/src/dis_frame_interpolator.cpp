@@ -61,13 +61,21 @@ void DisFrameInterpolator::SubmitFrame(
     bool has_new_pair = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        const std::uint64_t current_source_frame_id =
+            ++submitted_source_frames_;
         if (previous_real_frame_.empty()) {
             previous_real_frame_ = immutable_frame;
+            previous_real_frame_id_ = current_source_frame_id;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
 
             FrameSequence first_frame;
             first_frame.frames.push_back(previous_real_frame_);
+            first_frame.sequence_id = next_sequence_id_++;
+            first_frame.source_begin_id = current_source_frame_id;
+            first_frame.source_end_id = current_source_frame_id;
+            first_frame.source_end_arrival_time =
+                frame_arrival_time;
             ready_sequences_.push_back(std::move(first_frame));
             return;
         }
@@ -75,6 +83,7 @@ void DisFrameInterpolator::SubmitFrame(
         if (previous_real_frame_.size() != immutable_frame.size()) {
             ++generation_;
             previous_real_frame_ = immutable_frame;
+            previous_real_frame_id_ = current_source_frame_id;
             previous_frame_arrival_time_ = frame_arrival_time;
             previous_source_timestamp_ = source_timestamp;
             source_timestamp_fallback_active_ = false;
@@ -85,6 +94,11 @@ void DisFrameInterpolator::SubmitFrame(
 
             FrameSequence reset_frame;
             reset_frame.frames.push_back(previous_real_frame_);
+            reset_frame.sequence_id = next_sequence_id_++;
+            reset_frame.source_begin_id = current_source_frame_id;
+            reset_frame.source_end_id = current_source_frame_id;
+            reset_frame.source_end_arrival_time =
+                frame_arrival_time;
             ready_sequences_.push_back(std::move(reset_frame));
             last_error_ = "rendered frame size changed; interpolation state was reset";
             condition_.notify_all();
@@ -119,6 +133,11 @@ void DisFrameInterpolator::SubmitFrame(
             FramePair& newest_pending_pair = pending_pairs_.back();
             newest_pending_pair.second = immutable_frame;
             newest_pending_pair.source_interval += source_delta;
+            newest_pending_pair.source_end_id =
+                current_source_frame_id;
+            newest_pending_pair.source_end_arrival_time =
+                frame_arrival_time;
+            ++newest_pending_pair.coalesced_source_frames;
             ++coalesced_source_frames_;
         } else {
             pending_pairs_.push_back(
@@ -126,10 +145,16 @@ void DisFrameInterpolator::SubmitFrame(
                     previous_real_frame_,
                     immutable_frame,
                     source_delta,
-                    generation_});
+                    generation_,
+                    0,
+                    previous_real_frame_id_,
+                    current_source_frame_id,
+                    0,
+                    frame_arrival_time});
         }
 
         previous_real_frame_ = immutable_frame;
+        previous_real_frame_id_ = current_source_frame_id;
         previous_frame_arrival_time_ = frame_arrival_time;
         previous_source_timestamp_ = source_timestamp;
         has_new_pair = true;
@@ -152,12 +177,24 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
                 return false;
             }
 
+            FrameSequence& ready_sequence = ready_sequences_.front();
             active_frames_ =
-                std::move(ready_sequences_.front().frames);
+                std::move(ready_sequence.frames);
             active_frame_period_ =
-                ready_sequences_.front().frame_period;
+                ready_sequence.frame_period;
             const bool delay_before_first_frame =
-                ready_sequences_.front().delay_before_first_frame;
+                ready_sequence.delay_before_first_frame;
+            active_sequence_id_ = ready_sequence.sequence_id;
+            active_source_begin_id_ =
+                ready_sequence.source_begin_id;
+            active_source_end_id_ =
+                ready_sequence.source_end_id;
+            active_coalesced_source_frames_ =
+                ready_sequence.coalesced_source_frames;
+            active_source_span_ms_ =
+                ready_sequence.source_span_ms;
+            active_source_end_arrival_time_ =
+                ready_sequence.source_end_arrival_time;
             ready_sequences_.pop_front();
             active_frame_index_ = 0;
             if (delay_before_first_frame) {
@@ -183,6 +220,24 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
 
     if (timing != nullptr) {
         timing->starts_new_sequence = active_frame_index_ == 0;
+        timing->sequence_id = active_sequence_id_;
+        timing->source_begin_id = active_source_begin_id_;
+        timing->source_end_id = active_source_end_id_;
+        timing->frame_index = active_frame_index_ + 1;
+        timing->frame_count = active_frames_.size();
+        timing->coalesced_source_frames =
+            active_coalesced_source_frames_;
+        timing->source_span_ms = active_source_span_ms_;
+        timing->source_end_age_ms =
+            std::max(
+                0.0,
+                std::chrono::duration<double, std::milli>(
+                    now - active_source_end_arrival_time_).count());
+        timing->scheduled_lateness_ms =
+            std::max(
+                0.0,
+                std::chrono::duration<double, std::milli>(
+                    now - next_frame_deadline_).count());
     }
 
     bgr_frame = active_frames_[active_frame_index_];
@@ -217,10 +272,17 @@ std::string DisFrameInterpolator::ConsumeStatus() {
 
 DisQueueStats DisFrameInterpolator::GetQueueStats() {
     std::lock_guard<std::mutex> lock(mutex_);
+    const std::size_t active_frames_remaining =
+        active_frames_.size() > active_frame_index_ ?
+            active_frames_.size() - active_frame_index_ :
+            0;
     return DisQueueStats{
         coalesced_source_frames_,
+        generated_sequences_,
         pending_pairs_.size(),
-        ready_sequences_.size()};
+        ready_sequences_.size(),
+        active_frames_remaining,
+        worker_busy_};
 }
 
 void DisFrameInterpolator::WorkerLoop() {
@@ -238,6 +300,8 @@ void DisFrameInterpolator::WorkerLoop() {
 
             pair = std::move(pending_pairs_.front());
             pending_pairs_.pop_front();
+            pair.sequence_id = next_sequence_id_++;
+            worker_busy_ = true;
         }
 
         try {
@@ -255,14 +319,32 @@ void DisFrameInterpolator::WorkerLoop() {
             status << (config_.use_bidirectional_flow ?
                            "Bidirectional DIS" :
                            "Single-direction DIS")
-                   << ": " << config_.intermediate_frame_count
-                   << " intermediate display frames in "
+                   << ": sequence " << pair.sequence_id
+                   << " source " << pair.source_begin_id
+                   << "->" << pair.source_end_id
+                   << " | span "
                    << std::fixed << std::setprecision(1)
+                   << std::chrono::duration<double, std::milli>(
+                          pair.source_interval).count()
+                   << " ms | coalesced "
+                   << pair.coalesced_source_frames
+                   << " | " << config_.intermediate_frame_count
+                   << " intermediate display frames in "
                    << elapsed_ms << " ms";
             SetStatus(status.str());
         } catch (const cv::Exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second);
+            fallback.sequence_id = pair.sequence_id;
+            fallback.source_begin_id = pair.source_begin_id;
+            fallback.source_end_id = pair.source_end_id;
+            fallback.coalesced_source_frames =
+                pair.coalesced_source_frames;
+            fallback.source_span_ms =
+                std::chrono::duration<double, std::milli>(
+                    pair.source_interval).count();
+            fallback.source_end_arrival_time =
+                pair.source_end_arrival_time;
             if (PushReadySequence(
                     std::move(fallback), pair.generation)) {
                 SetError(
@@ -272,6 +354,16 @@ void DisFrameInterpolator::WorkerLoop() {
         } catch (const std::exception& error) {
             FrameSequence fallback;
             fallback.frames.push_back(pair.second);
+            fallback.sequence_id = pair.sequence_id;
+            fallback.source_begin_id = pair.source_begin_id;
+            fallback.source_end_id = pair.source_end_id;
+            fallback.coalesced_source_frames =
+                pair.coalesced_source_frames;
+            fallback.source_span_ms =
+                std::chrono::duration<double, std::milli>(
+                    pair.source_interval).count();
+            fallback.source_end_arrival_time =
+                pair.source_end_arrival_time;
             if (PushReadySequence(
                     std::move(fallback), pair.generation)) {
                 SetError(
@@ -292,8 +384,23 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         throw std::invalid_argument("interpolation pair has incompatible frames");
     }
 
+    const auto set_sequence_diagnostics =
+        [&pair](FrameSequence& sequence) {
+            sequence.sequence_id = pair.sequence_id;
+            sequence.source_begin_id = pair.source_begin_id;
+            sequence.source_end_id = pair.source_end_id;
+            sequence.coalesced_source_frames =
+                pair.coalesced_source_frames;
+            sequence.source_span_ms =
+                std::chrono::duration<double, std::milli>(
+                    pair.source_interval).count();
+            sequence.source_end_arrival_time =
+                pair.source_end_arrival_time;
+        };
+
     if (config_.intermediate_frame_count == 0) {
         FrameSequence passthrough;
+        set_sequence_diagnostics(passthrough);
         passthrough.frames.push_back(pair.second);
         return passthrough;
     }
@@ -380,6 +487,7 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         config_.intermediate_frame_count + 1;
 
     FrameSequence sequence;
+    set_sequence_diagnostics(sequence);
     sequence.frames.reserve(interval_count);
     sequence.frame_period =
         pair.source_interval /
@@ -449,10 +557,13 @@ bool DisFrameInterpolator::PushReadySequence(
     });
 
     if (stopping_ || generation != generation_) {
+        worker_busy_ = false;
         return false;
     }
 
     ready_sequences_.push_back(std::move(sequence));
+    ++generated_sequences_;
+    worker_busy_ = false;
     return true;
 }
 

@@ -13,6 +13,7 @@ visualization_node:
     interpolation_timing_source: "arrival"
     interpolation_lock_camera: true
     interpolation_show_source_window: false
+    interpolation_diagnostic_overlay: false
     interpolation_window_suffix: " - Bidirectional DIS x5"
 
     cam_front:
