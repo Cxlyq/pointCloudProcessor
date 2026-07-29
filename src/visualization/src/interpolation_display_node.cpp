@@ -384,9 +384,9 @@ public:
             RCLCPP_INFO(
                 this->get_logger(),
                 "[FPS] Display diagnostics use a %.1f s window. "
-                "[FPS] reports actual display-boundary calls; [PIPE] "
-                "separates DDS, interpolation queues, source age, and "
-                "HighGUI cost.",
+                "[FPS] reports the application display boundary named "
+                "in each line; [PIPE] separates DDS, interpolation "
+                "queues, source age, and HighGUI cost.",
                 fps_logging_interval_sec_);
         }
     }
@@ -689,7 +689,10 @@ private:
             if (highgui_event_thread_started_) {
                 RCLCPP_INFO(
                     this->get_logger(),
-                    "[*] HighGUI backend started its own event thread.");
+                    "[*] HighGUI backend started its own event thread. "
+                    "The FPS boundary is now imshow submission because "
+                    "HighGUI provides no event-thread presentation "
+                    "completion callback.");
                 return;
             }
             RCLCPP_WARN(
@@ -733,6 +736,12 @@ private:
         return use_wait_key_event_pump_ ?
             "main-thread-waitKey(1)" :
             "main-thread-pollKey()";
+    }
+
+    const char* ActiveDisplayBoundary() const noexcept {
+        return highgui_event_thread_started_ ?
+            "imshow-submit(window-thread)" :
+            "imshow+event-pump";
     }
 
     std::chrono::steady_clock::duration CalculateNextWaitDuration(
@@ -1008,8 +1017,8 @@ private:
         RCLCPP_INFO(
             this->get_logger(),
             "[FPS] Display \"%s\": source RX %.2f FPS "
-            "(+%llu, total %llu) | presented %.2f FPS "
-            "(+%llu, total %llu) | measured x%.2f / target x%zu | "
+            "(+%llu, total %llu) | display-boundary %.2f FPS "
+            "(+%llu, total %llu, %s) | measured x%.2f / target x%zu | "
             "%.1f s window | max display gap %.0f ms | "
             "source missing +%llu (total %llu), out-of-order +%llu "
             "(total %llu), unsequenced +%llu (total %llu) | "
@@ -1027,6 +1036,7 @@ private:
                 stats.window_presented_frames),
             static_cast<unsigned long long>(
                 stats.total_presented_frames),
+            ActiveDisplayBoundary(),
             measured_multiplier,
             intermediate_frame_count_ + 1,
             elapsed_sec,

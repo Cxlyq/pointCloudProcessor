@@ -66,20 +66,21 @@ interpolation_ready_sequence_capacity: 2
 
 ## HighGUI
 
-默认配置为：
+当前正式双向 ×5 配置为：
 
 ```yaml
-interpolation_highgui_event_mode: "wait_key"
+interpolation_highgui_event_mode: "start_window_thread"
 ```
 
-窗口创建、`imshow()` 和事件处理全部位于显示进程主线程。一次实测中，
-`pollKey()` 每轮耗时达到 700～1100 ms，而 `imshow()` 只有 1～4 ms，
-因此正式 ×5 配置改为调用 `waitKey(1)`。它仍会处理 HighGUI 事件并纳入
-显示边界计时，但不会沿用这次运行中表现异常的 `pollKey()` 路径。
+两次实测中，`pollKey()` 和 `waitKey(1)` 的事件处理都出现
+数百至一千多毫秒阻塞，而 `imshow()` 只有 1～4 ms。正式 ×5 配置因此
+请求 HighGUI 使用后端事件线程。若当前后端不支持，程序会明确警告并
+自动回退到主线程 `waitKey(1)`。
 
-`poll_key` 保留为诊断对照。也可以显式配置 `start_window_thread`；若当前
-HighGUI 后端不支持事件线程，程序会自动回退到主线程 `waitKey(1)`。启动
-日志和 `[PIPE]` 会分别报告请求模式与实际生效模式。
+`poll_key` 和 `wait_key` 保留为诊断对照。启动日志与 `[PIPE]` 会报告
+请求模式和实际生效模式。事件线程成功启动时，OpenCV 没有提供事件线程
+完成显示的回调，因此 `[FPS]` 的 display-boundary 是 `imshow` 提交边界；
+此时必须同时依据肉眼效果判断真实窗口刷新是否改善。
 
 ## 日志
 
@@ -98,25 +99,26 @@ HighGUI 后端不支持事件线程，程序会自动回退到主线程 `waitKey
 - `[FLOW]`：有序提交等待超过 100 ms。它表示主动反压，不表示丢帧。
 - `[HIGHGUI]`：`imshow` 或事件处理超过 100 ms。
 
-`presented` 的边界是应用完成 `imshow()` 和本轮 HighGUI 事件处理。
-OpenCV 没有跨平台的“显示器已经物理扫描此帧”回调，因此该数值是应用
-能获得的最接近最终显示端的真实统计，但不等同于显示器扫描时刻。
+主线程事件模式下，display-boundary 是应用完成 `imshow()` 和本轮
+HighGUI 事件处理；事件线程模式下，它是 `imshow()` 返回时的提交边界。
+OpenCV 没有跨平台的“显示器已经物理扫描此帧”回调，因此日志会明确
+标出当前边界，不能把事件线程模式的提交速率直接当成物理扫描速率。
 
 正常的双向 ×5 运行应满足：
 
 ```text
 [SRC-TX] published ≈ [FPS] source RX
-[FPS] presented ≈ source RX × 5
+[FPS] display-boundary ≈ source RX × 5
 source missing = 0
 out-of-order = 0
 display sequence breaks = 0
 source backpressure = 0（正常负载）
-[PIPE] mode main-thread-waitKey(1)
+[PIPE] mode window-thread
 ```
 
 如果 `source missing > 0`，帧丢在发布之后、显示回调之前，应继续检查
 DDS。若缺失和序列断裂均为 0，但 `imshow` 或 event 的最大耗时达到
-数百毫秒、`presented` 明显低于目标，则最终瓶颈仍在 HighGUI。若
+数百毫秒、display-boundary 明显低于目标，则最终瓶颈仍在 HighGUI。若
 pending/ready 长期满且 `source backpressure` 为 `ACTIVE`，说明最终
 消费能力低于输入需求；此时帧仍保持连续，但端到端延迟会继续增长。
 本轮修复验证时，还应确认 event 平均/最大耗时不再维持在

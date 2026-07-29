@@ -19,9 +19,10 @@
     # blocks and latency grows; no source pair or generated frame is dropped.
     interpolation_pending_pair_capacity: 3
     interpolation_ready_sequence_capacity: 2
-    # The current backend spent 700-1100 ms inside pollKey(). Keep HighGUI on
-    # the display main thread, but use a short measured waitKey(1) event cycle.
-    interpolation_highgui_event_mode: "wait_key"
+    # Both pollKey() and waitKey(1) spent hundreds of milliseconds in this
+    # runtime. Ask HighGUI to own event processing on its backend thread.
+    # Unsupported backends fall back to measured main-thread waitKey(1).
+    interpolation_highgui_event_mode: "start_window_thread"
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - Bidirectional DIS x5"
