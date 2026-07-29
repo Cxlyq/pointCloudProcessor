@@ -1,4 +1,4 @@
-visualization_node:
+/**:
   ros__parameters:
     subscribe_topic: "/reconstruction/white_mesh"
     camera_ids: ["cam_front"]
@@ -10,7 +10,10 @@ visualization_node:
     interpolation_flow_scale: 0.25
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: true
+    # Reject forward/backward flow disagreements at disocclusions.
+    interpolation_flow_consistency_mask: true
     interpolation_timing_source: "arrival"
+    interpolation_max_playback_lag_ms: 1000
     interpolation_lock_camera: true
     interpolation_show_source_window: false
     interpolation_window_suffix: " - Bidirectional DIS x5"

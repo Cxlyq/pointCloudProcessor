@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(pc_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(Threads REQUIRED) # 线程库
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc video)
@@ -39,9 +40,31 @@ ament_target_dependencies(
   visualization_node
   "rclcpp"
   "pc_msgs"
+  "sensor_msgs"
 )
 
-install(TARGETS visualization_node
+add_executable(interpolation_display_node
+        src/interpolation_display_node.cpp
+)
+target_include_directories(interpolation_display_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(interpolation_display_node
+        ${OpenCV_LIBS}
+)
+target_compile_features(
+  interpolation_display_node PUBLIC cxx_std_17)
+ament_target_dependencies(
+  interpolation_display_node
+  "rclcpp"
+  "sensor_msgs"
+)
+
+install(TARGETS
+  visualization_node
+  interpolation_display_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY
@@ -51,7 +74,41 @@ install(DIRECTORY
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+
+  ament_add_gtest(dis_frame_interpolator_test
+    test/dis_frame_interpolator_test.cpp
+    src/dis_frame_interpolator.cpp
+  )
+  target_include_directories(dis_frame_interpolator_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_link_libraries(dis_frame_interpolator_test
+    ${OpenCV_LIBS}
+    Threads::Threads
+  )
+  target_compile_features(
+    dis_frame_interpolator_test PUBLIC cxx_std_17)
+
+  ament_add_gtest(ros_image_conversion_test
+    test/ros_image_conversion_test.cpp
+  )
+  target_include_directories(ros_image_conversion_test PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_link_libraries(ros_image_conversion_test
+    ${OpenCV_LIBS}
+  )
+  target_compile_features(
+    ros_image_conversion_test PUBLIC cxx_std_17)
+  ament_target_dependencies(
+    ros_image_conversion_test
+    "sensor_msgs"
+  )
+
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)

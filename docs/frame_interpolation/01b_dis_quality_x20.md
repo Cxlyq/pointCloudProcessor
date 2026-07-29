@@ -23,6 +23,7 @@ interpolation_intermediate_frames: 19
 interpolation_flow_scale: 0.5
 interpolation_dis_preset: "ultrafast"
 interpolation_bidirectional_flow: false
+interpolation_max_playback_lag_ms: 1000
 ```
 
 19 张中间帧复用同一份光流，不会执行 19 次光流计算。相对基础版，新增开销主要来自：

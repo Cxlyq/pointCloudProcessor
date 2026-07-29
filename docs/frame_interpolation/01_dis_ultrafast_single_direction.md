@@ -19,7 +19,8 @@ DIS 预设：ULTRAFAST
 光流方向：I0 -> I1，一次
 ```
 
-所有光流和中间画面都在可视化包内部处理，不发布到 ROS。
+光流仍只在可视化包内部处理；按时到期的中间画面通过包内使用的
+`sensor_msgs/Image` 话题发送给独立显示进程。
 
 ## 实现文件
 
@@ -28,11 +29,14 @@ DIS 预设：ULTRAFAST
   - 锁定配置中的相机；
   - 插帧模式下隐藏 Open3D 源渲染窗口，只显示 OpenCV 插值窗口；
   - 仅在真实网格到达时渲染一次源画面，避免持续重绘阻塞插值播放。
+- `src/visualization/src/interpolation_display_node.cpp`
+  - 在独立 ROS 2 进程的主线程创建和更新 HighGUI 窗口；
+  - 使用有界、best-effort 图像订阅，不在显示较慢时反压生成节点。
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
   - 默认生成 4 张中间帧；
-  - 根据真实帧到达间隔均匀播放全部中间帧，不丢弃逾期帧。
+  - 根据真实帧到达间隔调度中间帧，并只保留当前最新到期帧。
 - `src/visualization/config/v_dis_ultrafast_config.yaml`
   - 第一阶段独立参数。
 - `src/visualization/launch/v_dis_ultrafast.launch.py`
@@ -69,7 +73,7 @@ source install/setup.bash
 ros2 launch visualization v_dis_ultrafast.launch.py
 ```
 
-默认只出现一个窗口：
+launch 会启动生成节点和独立显示节点，默认只出现一个可见窗口：
 
 `Real-time Render - Front View - DIS x5`：延迟播放的插值画面。
 
@@ -90,6 +94,9 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 | `interpolation_flow_scale` | `0.25` | DIS 计算分辨率 |
 | `interpolation_dis_preset` | `ultrafast` | `ultrafast`、`fast` 或 `medium` |
 | `interpolation_bidirectional_flow` | `false` | 保持阶段 1 的单向光流 |
+| `interpolation_flow_consistency_mask` | `false` | 仅双向流可用；阶段 1 保持关闭 |
+| `interpolation_timing_source` | `arrival` | 使用真实帧到达间隔计算播放步长 |
+| `interpolation_max_playback_lag_ms` | `1000` | 播放截止时间落后超过该值时跳到最新真实帧 |
 | `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
 | `interpolation_show_source_window` | `false` | 是否显示仅用于调试的 Open3D 源窗口 |
 
@@ -130,3 +137,7 @@ ros2 launch visualization v_vis.launch.py
 - 原始 `v_vis.launch.py` 不启用插帧，相机仅在第一帧设置，不受
   `interpolation_lock_camera` 影响；
 - 中间帧在后台预生成，计算完成前会保持上一张已显示画面。
+- 完整中间帧序列进入 ready 队列后才会唤醒输出调度线程；正常迟到只跳过已经过期的
+  显示帧，累计迟到超过 1 秒才重置到最新真实帧。
+- HighGUI 只在 `interpolation_display_node` 的主线程运行，避免 ROS 2/Linux 上 Qt
+  后端从工作线程创建窗口。

@@ -62,9 +62,20 @@ ros2 launch visualization v_dis_bidirectional.launch.py
 ros2 launch visualization v_dis_quality_x20.launch.py
 ```
 
-三个插帧入口默认都只显示插值结果窗口；Open3D 源渲染窗口在后台隐藏，并且只在新
-网格到达时渲染一次，避免占用插值播放线程。隐藏渲染器使用显式离屏渲染后再截图，
-不会读取未渲染的黑色前缓冲。
+三个插帧入口会同时启动 `visualization_node` 和 `interpolation_display_node` 两个
+ROS 2 进程。Open3D 源渲染窗口在生成进程中保持隐藏，并且只在新网格到达时渲染一次；
+生成完成的中间帧按 deadline 发布到本机
+`interpolated_frames/<camera_id>` 图像话题。显示进程的
+主线程负责 OpenCV 窗口的创建、`imshow()`、`waitKey()` 和销毁。因此无论 OpenCV 使用
+Qt、GTK 还是 Win32 后端，都不会从工作线程创建 GUI；较慢的 HighGUI 后端也不会阻塞
+Open3D 所在进程。
+
+Worker 会先把完整 `FrameSequence` 放入 ready 队列，再通知输出调度线程。输出调度线程
+按下一帧截止时间唤醒；10 ms 轮询只用于等待 DDS 发现尚未连接的显示订阅者。若一次唤醒时
+已有多张帧过期，只发布其中最新的到期帧，避免恢复后突发快速刷出旧帧。正常情况下仍按
+真实帧间隔计算的时间线连续播放；只有播放截止时间实际落后超过
+`interpolation_max_playback_lag_ms`（默认 `1000` ms）时，才丢弃旧队列并跳到当前
+最新真实帧。这个跳变只用于输入、计算或显示后端异常造成的严重积压。
 
 ## 版本对照
 
@@ -72,7 +83,7 @@ ros2 launch visualization v_dis_quality_x20.launch.py
 | --- | ---: | ---: | --- | --- |
 | `v_vis.launch.py` | 0 | 无 | 无 | 原始可视化基线 |
 | `v_dis_ultrafast.launch.py` | 4 | 1/4 | 单向 | 保留的低开销基础版 |
-| `v_dis_bidirectional.launch.py` | 4 | 1/4 | 双向 | 对照轮廓重影 |
+| `v_dis_bidirectional.launch.py` | 4 | 1/4 | 双向 + 一致性掩码 | 对照轮廓重影 |
 | `v_dis_quality_x20.launch.py` | 19 | 1/2 | 单向 | 本轮帧数与清晰度测试 |
 
 不要同时启动多个可视化 launch；需要比较时，先停止当前可视化节点再切换。
@@ -89,7 +100,7 @@ fps_logging_interval_sec: 5.0
 原始可视化输出：
 
 ```text
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
+[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
 ```
 
 这里统计的是完成新网格渲染的频率，不把没有新内容的 UI 空转计为新帧。
@@ -98,16 +109,40 @@ fps_logging_interval_sec: 5.0
 
 ```text
 [GEN] Single-direction DIS: 19 intermediate display frames in 320.5 ms
-[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms.
-[FPS] Interpolated "...": playback 9.8 FPS | effective 8.7 FPS | 5.1 s window | max gap 410 ms.
+[FPS] Source "...": 0.50 FPS | 6.0 s window | max gap 2010 ms | superseded meshes +0 (total 3).
+[FPS] Interpolated "...": playback 9.8 FPS | effective 8.7 FPS | 5.1 s window | max gap 410 ms | coalesced +1 (total 4) | skipped +0 (total 2) | resets +0 (total 0) | queue 1 pending / 0 ready / 6 active | worker busy | lag 12.3 ms.
 ```
 
-- `playback FPS`：同一批中间帧连续播放时，根据实际提交间隔计算，更接近运动时的体感；
+- `playback FPS`：同一批中间帧连续发布时，根据实际发布间隔计算，更接近运动时的体感；
 - `effective FPS`：把批次间等待、计算和排队的停顿也计入，通常更低；
 - `max gap`：统计窗口内相邻输出帧的最大间隔，用于识别平均 FPS 掩盖的卡顿；
+- `+N (total M)`：`N` 是当前统计窗口新增次数，`M` 是进程启动后的累计次数；
+- `skipped`：输出调度线程迟到时被更新的到期帧，以及超出最大延迟后被清理的排队帧；
+- `resets`：播放延迟超过阈值并跳到最新真实帧的次数；
+- `pending / ready / active`：待生成的真实帧对、已生成序列，以及当前播放序列剩余帧数；
+- `worker` 和 `lag`：生成线程是否忙碌，以及当前活动帧超过播放截止时间的毫秒数；
 - `[GEN]`：每对真实帧生成的中间显示帧数量和总耗时。
 
-OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此插值 FPS 的测量点是
-`imshow()` 完成提交的时刻。相比旧统计，新统计不再因两秒空档重置，并把批内播放速度
-与包含停顿的长期有效速度分开报告。源网格渲染耗时和 HighGUI 后端信息已降为 DEBUG，
-默认 INFO 日志主要保留 `[GEN]`、`[FPS]`、警告和错误。
+待生成队列已满时，`coalesced` 表示新真实帧被合并进最新待处理帧对。合并后的播放
+周期使用被合并源间隔的平均值，而不是把多个源间隔总和当成一个周期，因此连续输入
+间隔相近时不会因为一次合并把名义播放帧率减半。
+
+发生最大延迟重置时会额外输出 `[LATENCY]` 警告，其中包含重置前延迟和清理帧数。
+这里的 `lag` 是相对播放截止时间的调度迟到，不是“最新真实帧到达后经过了多久”；
+因此正常的低源帧率和允许的首段等待不会触发重置。
+
+OpenCV HighGUI 没有跨平台的“显示器已经扫描并呈现此帧”回调，因此生成节点的插值 FPS
+测量点是 `sensor_msgs/Image` 完成发布的时刻，不等同于显示器扫描时刻。图像话题使用
+`KeepLast + best_effort` 的有界实时策略；显示节点在主线程回调中只保留每个窗口的最新
+消息。默认 INFO 日志主要保留 `[GEN]`、`[FPS]`、警告和错误。
+
+## 自动化验证
+
+插值器测试覆盖合并时间间隔、显示帧所有权、ready 入队通知、到期帧合并、1 秒最大延迟
+策略、队列状态与播放延迟、消息时间戳回退、尺寸变化重置，以及双向一致性路径；另有
+测试验证连续图像、带 stride 的 ROI 和畸形 `sensor_msgs/Image` 转换：
+
+```bash
+colcon test --packages-select visualization
+colcon test-result --verbose
+```

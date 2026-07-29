@@ -1,4 +1,4 @@
-visualization_node:
+/**:
   ros__parameters:
     subscribe_topic: "/reconstruction/white_mesh"
     camera_ids: ["cam_front"]
@@ -12,7 +12,9 @@ visualization_node:
     interpolation_flow_scale: 0.25
     interpolation_dis_preset: "ultrafast"
     interpolation_bidirectional_flow: false
+    interpolation_flow_consistency_mask: false
     interpolation_timing_source: "arrival"
+    interpolation_max_playback_lag_ms: 1000
     interpolation_lock_camera: true
     # Open3D is retained as a hidden renderer. Set true only when debugging
     # source-frame capture; normal interpolation mode shows one window.

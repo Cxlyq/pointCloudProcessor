@@ -1,4 +1,5 @@
 #include "visualization/dis_frame_interpolator.hpp"
+#include "visualization/interpolation_timing.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,8 +13,63 @@
 
 namespace pointcloud_visualization {
 
-DisFrameInterpolator::DisFrameInterpolator(DisInterpolationConfig config)
-    : config_(std::move(config)) {
+struct DisFrameInterpolator::WorkerCache {
+    explicit WorkerCache(const DisInterpolationConfig& config)
+        : forward_dis(cv::DISOpticalFlow::create(config.dis_preset)) {
+        if (config.use_bidirectional_flow) {
+            backward_dis =
+                cv::DISOpticalFlow::create(config.dis_preset);
+        }
+    }
+
+    cv::Ptr<cv::DISOpticalFlow> forward_dis;
+    cv::Ptr<cv::DISOpticalFlow> backward_dis;
+
+    cv::Size flow_input_size;
+    cv::Mat first_small;
+    cv::Mat second_small;
+    cv::Mat first_gray;
+    cv::Mat second_gray;
+    cv::Mat forward_flow_full;
+    cv::Mat backward_flow_full;
+    std::vector<cv::Mat> forward_flow_channels;
+    std::vector<cv::Mat> backward_flow_channels;
+
+    cv::Size grid_size;
+    cv::Mat grid_x;
+    cv::Mat grid_y;
+    cv::Mat first_map_x;
+    cv::Mat first_map_y;
+    cv::Mat second_map_x;
+    cv::Mat second_map_y;
+    cv::Mat warped_first;
+    cv::Mat warped_second;
+
+    cv::Mat consistency_map_x;
+    cv::Mat consistency_map_y;
+    cv::Mat sampled_opposite_x;
+    cv::Mat sampled_opposite_y;
+    cv::Mat consistency_error_x;
+    cv::Mat consistency_error_y;
+    cv::Mat consistency_error_squared;
+    cv::Mat consistency_magnitude_squared;
+    cv::Mat consistency_threshold_squared;
+    cv::Mat consistency_valid_x;
+    cv::Mat consistency_valid_y;
+    cv::Mat forward_confidence;
+    cv::Mat backward_confidence;
+    cv::Mat warped_forward_confidence;
+    cv::Mat warped_backward_confidence;
+    cv::Mat inverse_confidence;
+    cv::Mat only_first_confident;
+    cv::Mat only_second_confident;
+};
+
+DisFrameInterpolator::DisFrameInterpolator(
+    DisInterpolationConfig config,
+    std::function<void()> ready_callback)
+    : config_(std::move(config)),
+      ready_callback_(std::move(ready_callback)) {
     if (!std::isfinite(config_.flow_scale) ||
         config_.flow_scale <= 0.0 ||
         config_.flow_scale > 1.0) {
@@ -26,7 +82,18 @@ DisFrameInterpolator::DisFrameInterpolator(DisInterpolationConfig config)
     if (config_.max_pending_pairs == 0 || config_.max_ready_sequences == 0) {
         throw std::invalid_argument("interpolation queue limits must be greater than zero");
     }
+    if (config_.max_playback_lag <=
+        std::chrono::steady_clock::duration::zero()) {
+        throw std::invalid_argument(
+            "interpolation max_playback_lag must be greater than zero");
+    }
+    if (config_.use_flow_consistency_mask &&
+        !config_.use_bidirectional_flow) {
+        throw std::invalid_argument(
+            "flow consistency masking requires bidirectional flow");
+    }
 
+    worker_cache_ = std::make_unique<WorkerCache>(config_);
     worker_ = std::thread(&DisFrameInterpolator::WorkerLoop, this);
 }
 
@@ -58,7 +125,9 @@ void DisFrameInterpolator::SubmitFrame(
     // instances below share this reference-counted storage instead of cloning
     // the same real frame several times.
     cv::Mat immutable_frame = bgr_frame.clone();
-    bool has_new_pair = false;
+    bool notify_worker = false;
+    bool notify_all_workers = false;
+    bool notify_ready = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (previous_real_frame_.empty()) {
@@ -67,12 +136,14 @@ void DisFrameInterpolator::SubmitFrame(
             previous_source_timestamp_ = source_timestamp;
 
             FrameSequence first_frame;
-            first_frame.frames.push_back(previous_real_frame_);
+            // The returned display frame is writable from OpenCV's point of
+            // view. Give the display queue its own storage so a future overlay
+            // cannot mutate the real-frame endpoint retained for interpolation.
+            first_frame.frames.push_back(previous_real_frame_.clone());
             ready_sequences_.push_back(std::move(first_frame));
-            return;
-        }
-
-        if (previous_real_frame_.size() != immutable_frame.size()) {
+            notify_ready = true;
+        } else if (
+            previous_real_frame_.size() != immutable_frame.size()) {
             ++generation_;
             previous_real_frame_ = immutable_frame;
             previous_frame_arrival_time_ = frame_arrival_time;
@@ -84,85 +155,114 @@ void DisFrameInterpolator::SubmitFrame(
             active_frame_index_ = 0;
 
             FrameSequence reset_frame;
-            reset_frame.frames.push_back(previous_real_frame_);
+            reset_frame.frames.push_back(previous_real_frame_.clone());
             ready_sequences_.push_back(std::move(reset_frame));
             last_error_ = "rendered frame size changed; interpolation state was reset";
-            condition_.notify_all();
-            return;
-        }
-
-        auto source_delta =
-            frame_arrival_time - previous_frame_arrival_time_;
-        if (config_.use_source_timestamps) {
-            const bool source_timestamps_are_usable =
-                source_timestamp.has_value() &&
-                previous_source_timestamp_.has_value() &&
-                *source_timestamp > *previous_source_timestamp_;
-            if (source_timestamps_are_usable) {
-                source_delta =
-                    std::chrono::duration_cast<
-                        std::chrono::steady_clock::duration>(
-                        *source_timestamp -
-                        *previous_source_timestamp_);
-                source_timestamp_fallback_active_ = false;
-            } else if (!source_timestamp_fallback_active_) {
-                last_error_ =
-                    "message timestamps are missing or non-monotonic; "
-                    "interpolation timing fell back to frame arrival times";
-                source_timestamp_fallback_active_ = true;
-            }
-        }
-        if (pending_pairs_.size() >= config_.max_pending_pairs) {
-            // Preserve the sequence boundary instead of dropping an interior
-            // pair. For example, replace C->D with C->E so that a preceding
-            // B->C sequence still connects to the newest accepted frame.
-            FramePair& newest_pending_pair = pending_pairs_.back();
-            newest_pending_pair.second = immutable_frame;
-            newest_pending_pair.source_interval += source_delta;
-            ++coalesced_source_frames_;
+            notify_all_workers = true;
+            notify_ready = true;
         } else {
-            pending_pairs_.push_back(
-                FramePair{
-                    previous_real_frame_,
-                    immutable_frame,
-                    source_delta,
-                    generation_});
-        }
+            auto source_delta =
+                frame_arrival_time - previous_frame_arrival_time_;
+            if (config_.use_source_timestamps) {
+                const bool source_timestamps_are_usable =
+                    source_timestamp.has_value() &&
+                    previous_source_timestamp_.has_value() &&
+                    *source_timestamp > *previous_source_timestamp_;
+                if (source_timestamps_are_usable) {
+                    source_delta =
+                        std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                            *source_timestamp -
+                            *previous_source_timestamp_);
+                    source_timestamp_fallback_active_ = false;
+                } else if (!source_timestamp_fallback_active_) {
+                    last_error_ =
+                        "message timestamps are missing or non-monotonic; "
+                        "interpolation timing fell back to frame arrival times";
+                    source_timestamp_fallback_active_ = true;
+                }
+            }
 
-        previous_real_frame_ = immutable_frame;
-        previous_frame_arrival_time_ = frame_arrival_time;
-        previous_source_timestamp_ = source_timestamp;
-        has_new_pair = true;
+            if (pending_pairs_.size() >= config_.max_pending_pairs) {
+                // Preserve the sequence boundary instead of dropping an
+                // interior pair. For example, replace C->D with C->E so that a
+                // preceding B->C sequence still connects to the newest
+                // accepted frame. Track how many adjacent source intervals
+                // were merged so playback can use their average interval
+                // instead of reducing its nominal frame rate in proportion to
+                // the number of coalesced frames.
+                FramePair& newest_pending_pair = pending_pairs_.back();
+                newest_pending_pair.second = immutable_frame;
+                newest_pending_pair.source_interval_sum += source_delta;
+                ++newest_pending_pair.source_interval_count;
+                ++coalesced_source_frames_;
+            } else {
+                pending_pairs_.push_back(
+                    FramePair{
+                        previous_real_frame_,
+                        immutable_frame,
+                        source_delta,
+                        1,
+                        generation_});
+            }
+
+            previous_real_frame_ = immutable_frame;
+            previous_frame_arrival_time_ = frame_arrival_time;
+            previous_source_timestamp_ = source_timestamp;
+            notify_worker = true;
+        }
     }
 
-    if (has_new_pair) {
+    if (notify_all_workers) {
+        condition_.notify_all();
+    } else if (notify_worker) {
         condition_.notify_one();
+    }
+    if (notify_ready) {
+        NotifyReady();
     }
 }
 
 bool DisFrameInterpolator::TryGetDisplayFrame(
     cv::Mat& bgr_frame,
     DisDisplayTiming* timing) {
+    if (timing != nullptr) {
+        *timing = DisDisplayTiming{};
+    }
+
+    bool released_ready_slot = false;
+    bool reset_playback = false;
+    cv::Mat display_frame;
+    cv::Mat latest_real_frame;
+    std::vector<std::vector<cv::Mat>> retired_active_sequences;
+    std::deque<FrameSequence> retired_ready_sequences;
+    std::deque<FramePair> retired_pending_pairs;
+    std::unique_lock<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
 
-    if (active_frames_.empty()) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (ready_sequences_.empty()) {
-                return false;
+    const auto activate_next_sequence = [this, now,
+                                         &released_ready_slot]() {
+        while (active_frames_.empty() &&
+               !ready_sequences_.empty()) {
+            FrameSequence sequence =
+                std::move(ready_sequences_.front());
+            ready_sequences_.pop_front();
+            released_ready_slot = true;
+
+            // Every sequence produced internally contains at least one frame.
+            // Ignore an empty sequence defensively without changing the
+            // playback timeline.
+            if (sequence.frames.empty()) {
+                continue;
             }
 
-            active_frames_ =
-                std::move(ready_sequences_.front().frames);
-            active_frame_period_ =
-                ready_sequences_.front().frame_period;
-            const bool delay_before_first_frame =
-                ready_sequences_.front().delay_before_first_frame;
-            ready_sequences_.pop_front();
+            active_frames_ = std::move(sequence.frames);
+            active_frame_period_ = sequence.frame_period;
             active_frame_index_ = 0;
-            if (delay_before_first_frame) {
+            if (sequence.delay_before_first_frame) {
                 if (playback_timeline_initialized_) {
-                    next_frame_deadline_ += active_frame_period_;
+                    next_frame_deadline_ +=
+                        active_frame_period_;
                 } else {
                     next_frame_deadline_ =
                         now + active_frame_period_;
@@ -173,31 +273,116 @@ bool DisFrameInterpolator::TryGetDisplayFrame(
                 playback_timeline_initialized_ = false;
             }
         }
-        // A blocked producer may now publish the next contiguous sequence.
-        condition_.notify_all();
-    }
+    };
 
-    if (now < next_frame_deadline_) {
+    activate_next_sequence();
+    if (active_frames_.empty()) {
+        lock.unlock();
+        if (released_ready_slot) {
+            condition_.notify_all();
+        }
         return false;
     }
 
-    if (timing != nullptr) {
-        timing->starts_new_sequence = active_frame_index_ == 0;
+    if (playback_timeline_initialized_ &&
+        now > next_frame_deadline_) {
+        const auto playback_lag = now - next_frame_deadline_;
+        if (playback_lag > config_.max_playback_lag) {
+            std::size_t discarded_frames =
+                active_frames_.size() - active_frame_index_;
+            for (const auto& sequence : ready_sequences_) {
+                discarded_frames += sequence.frames.size();
+            }
+
+            ++generation_;
+            skipped_display_frames_ += discarded_frames;
+            ++latency_resets_;
+
+            retired_active_sequences.push_back(
+                std::move(active_frames_));
+            active_frames_.clear();
+            retired_ready_sequences.swap(ready_sequences_);
+            retired_pending_pairs.swap(pending_pairs_);
+            latest_real_frame = previous_real_frame_;
+
+            active_frame_index_ = 0;
+            active_frame_period_ =
+                std::chrono::steady_clock::duration::zero();
+            next_frame_deadline_ = now;
+            playback_timeline_initialized_ = false;
+            reset_playback = true;
+
+            if (timing != nullptr) {
+                timing->starts_new_sequence = true;
+                timing->latency_reset = true;
+                timing->skipped_frames = discarded_frames;
+                timing->lag_before_reset_ms =
+                    std::chrono::duration<double, std::milli>(
+                        playback_lag).count();
+            }
+        }
     }
 
-    bgr_frame = active_frames_[active_frame_index_];
-    ++active_frame_index_;
+    if (!reset_playback) {
+        bool has_display_frame = false;
+        bool display_starts_new_sequence = false;
+        std::size_t skipped_frames = 0;
 
-    if (active_frame_index_ >= active_frames_.size()) {
-        active_frames_.clear();
-        active_frame_index_ = 0;
+        while (!active_frames_.empty() &&
+               now >= next_frame_deadline_) {
+            if (has_display_frame) {
+                ++skipped_frames;
+            }
+            display_frame =
+                active_frames_[active_frame_index_];
+            display_starts_new_sequence =
+                active_frame_index_ == 0;
+            has_display_frame = true;
+            ++active_frame_index_;
+
+            if (active_frame_index_ >= active_frames_.size()) {
+                // Move large image batches out while locked, then release
+                // their storage after unlocking.
+                retired_active_sequences.push_back(
+                    std::move(active_frames_));
+                active_frames_.clear();
+                active_frame_index_ = 0;
+                activate_next_sequence();
+            } else {
+                next_frame_deadline_ +=
+                    active_frame_period_;
+            }
+        }
+
+        skipped_display_frames_ += skipped_frames;
+        if (timing != nullptr) {
+            timing->starts_new_sequence =
+                display_starts_new_sequence;
+            timing->skipped_frames = skipped_frames;
+        }
+
+        if (!has_display_frame) {
+            lock.unlock();
+            if (released_ready_slot) {
+                // A blocked producer may now publish the next contiguous
+                // sequence.
+                condition_.notify_all();
+            }
+            return false;
+        }
+    }
+
+    lock.unlock();
+    if (released_ready_slot || reset_playback) {
+        condition_.notify_all();
+    }
+    if (reset_playback) {
+        // The latest real frame is retained internally as an interpolation
+        // endpoint. Keep the display boundary writable without aliasing it.
+        bgr_frame = latest_real_frame.clone();
     } else {
-        // Keep one continuous playback timeline. If presentation was late,
-        // later calls catch up instead of permanently stretching the rest of
-        // this sequence and forcing newer sequences to wait.
-        next_frame_deadline_ += active_frame_period_;
+        bgr_frame = std::move(display_frame);
     }
-
     return true;
 }
 
@@ -217,10 +402,45 @@ std::string DisFrameInterpolator::ConsumeStatus() {
 
 DisQueueStats DisFrameInterpolator::GetQueueStats() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return DisQueueStats{
-        coalesced_source_frames_,
-        pending_pairs_.size(),
-        ready_sequences_.size()};
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t active_frames_remaining =
+        active_frames_.size() > active_frame_index_ ?
+            active_frames_.size() - active_frame_index_ :
+            0;
+    double playback_lag_ms = 0.0;
+    if (active_frames_remaining > 0 &&
+        playback_timeline_initialized_ &&
+        now > next_frame_deadline_) {
+        playback_lag_ms =
+            std::chrono::duration<double, std::milli>(
+                now - next_frame_deadline_).count();
+    }
+
+    DisQueueStats stats;
+    stats.coalesced_source_frames = coalesced_source_frames_;
+    stats.skipped_display_frames = skipped_display_frames_;
+    stats.latency_resets = latency_resets_;
+    stats.pending_pairs = pending_pairs_.size();
+    stats.ready_sequences = ready_sequences_.size();
+    stats.worker_busy = worker_busy_;
+    stats.active_frames_remaining = active_frames_remaining;
+    stats.playback_lag_ms = playback_lag_ms;
+    return stats;
+}
+
+std::optional<std::chrono::steady_clock::time_point>
+DisFrameInterpolator::GetNextDisplayDeadline() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!active_frames_.empty() &&
+        active_frame_index_ < active_frames_.size()) {
+        return next_frame_deadline_;
+    }
+    if (!ready_sequences_.empty()) {
+        // The presentation thread must activate the sequence before its exact
+        // first-frame deadline can be known.
+        return std::chrono::steady_clock::now();
+    }
+    return std::nullopt;
 }
 
 void DisFrameInterpolator::WorkerLoop() {
@@ -238,52 +458,66 @@ void DisFrameInterpolator::WorkerLoop() {
 
             pair = std::move(pending_pairs_.front());
             pending_pairs_.pop_front();
+            worker_busy_ = true;
         }
 
+        FrameSequence sequence;
+        std::string success_status;
+        std::string failure_message;
         try {
             const auto start_time = std::chrono::steady_clock::now();
-            FrameSequence sequence = BuildSequence(pair);
+            sequence = BuildSequence(pair);
             const auto elapsed_time = std::chrono::steady_clock::now() - start_time;
             const double elapsed_ms =
                 std::chrono::duration<double, std::milli>(elapsed_time).count();
 
-            if (!PushReadySequence(
-                    std::move(sequence), pair.generation)) {
-                continue;
-            }
             std::ostringstream status;
             status << (config_.use_bidirectional_flow ?
                            "Bidirectional DIS" :
                            "Single-direction DIS")
+                   << (config_.use_flow_consistency_mask ?
+                           " + consistency mask" : "")
                    << ": " << config_.intermediate_frame_count
                    << " intermediate display frames in "
                    << std::fixed << std::setprecision(1)
                    << elapsed_ms << " ms";
-            SetStatus(status.str());
+            success_status = status.str();
         } catch (const cv::Exception& error) {
-            FrameSequence fallback;
-            fallback.frames.push_back(pair.second);
-            if (PushReadySequence(
-                    std::move(fallback), pair.generation)) {
-                SetError(
-                    std::string("OpenCV DIS interpolation failed: ") +
-                    error.what());
-            }
+            sequence = FrameSequence{};
+            sequence.frames.push_back(pair.second.clone());
+            failure_message =
+                std::string("OpenCV DIS interpolation failed: ") +
+                error.what();
         } catch (const std::exception& error) {
-            FrameSequence fallback;
-            fallback.frames.push_back(pair.second);
-            if (PushReadySequence(
-                    std::move(fallback), pair.generation)) {
-                SetError(
-                    std::string("frame interpolation failed: ") +
-                    error.what());
+            sequence = FrameSequence{};
+            sequence.frames.push_back(pair.second.clone());
+            failure_message =
+                std::string("frame interpolation failed: ") +
+                error.what();
+        }
+
+        const bool sequence_was_published =
+            PushReadySequence(
+                std::move(sequence), pair.generation);
+        if (sequence_was_published) {
+            if (failure_message.empty()) {
+                SetStatus(std::move(success_status));
+            } else {
+                SetError(std::move(failure_message));
             }
+        }
+        SetWorkerBusy(false);
+        if (sequence_was_published) {
+            // The complete sequence is already visible in ready_sequences_.
+            // The callback only wakes the external presentation scheduler; it
+            // does not transfer ownership or bypass deadline-based playback.
+            NotifyReady();
         }
     }
 }
 
 DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
-    const FramePair& pair) const {
+    const FramePair& pair) {
     if (pair.first.empty() || pair.second.empty()) {
         throw std::invalid_argument("interpolation pair contains an empty frame");
     }
@@ -294,7 +528,7 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
 
     if (config_.intermediate_frame_count == 0) {
         FrameSequence passthrough;
-        passthrough.frames.push_back(pair.second);
+        passthrough.frames.push_back(pair.second.clone());
         return passthrough;
     }
 
@@ -313,25 +547,47 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
         throw std::invalid_argument("rendered frame is too small for DIS optical flow");
     }
 
-    cv::Mat first_small;
-    cv::Mat second_small;
-    cv::resize(pair.first, first_small, cv::Size(small_width, small_height),
-               0.0, 0.0, cv::INTER_AREA);
-    cv::resize(pair.second, second_small, cv::Size(small_width, small_height),
-               0.0, 0.0, cv::INTER_AREA);
+    WorkerCache& cache = *worker_cache_;
+    const cv::Size small_size(small_width, small_height);
+    if (cache.flow_input_size != small_size) {
+        if (cache.flow_input_size.width > 0 &&
+            cache.flow_input_size.height > 0) {
+            // Recreate only on a resolution transition. Some OpenCV releases
+            // cannot safely call calc() again after collectGarbage(), while a
+            // fresh instance avoids carrying size-specific internal buffers.
+            cache.forward_dis =
+                cv::DISOpticalFlow::create(config_.dis_preset);
+            if (config_.use_bidirectional_flow) {
+                cache.backward_dis =
+                    cv::DISOpticalFlow::create(config_.dis_preset);
+            }
+        }
+        cache.flow_input_size = small_size;
+    }
+    cv::resize(
+        pair.first, cache.first_small, small_size,
+        0.0, 0.0, cv::INTER_AREA);
+    cv::resize(
+        pair.second, cache.second_small, small_size,
+        0.0, 0.0, cv::INTER_AREA);
 
-    cv::Mat first_gray;
-    cv::Mat second_gray;
-    cv::cvtColor(first_small, first_gray, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(second_small, second_gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(
+        cache.first_small, cache.first_gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(
+        cache.second_small, cache.second_gray, cv::COLOR_BGR2GRAY);
 
+    // Keep the output empty on every call. DIS can interpret a non-empty
+    // InputOutputArray as an initial flow estimate; only the algorithm object
+    // and its internal work buffers are intentionally reused here.
     cv::Mat flow_small;
-    auto dis = cv::DISOpticalFlow::create(config_.dis_preset);
-    dis->calc(first_gray, second_gray, flow_small);
+    cache.forward_dis->calc(
+        cache.first_gray, cache.second_gray, flow_small);
 
     const auto resize_flow_to_full_resolution =
-        [&pair, small_width, small_height](const cv::Mat& small_flow) {
-            cv::Mat full_flow;
+        [&pair, small_width, small_height](
+            const cv::Mat& small_flow,
+            cv::Mat& full_flow,
+            std::vector<cv::Mat>& channels) {
             cv::resize(
                 small_flow,
                 full_flow,
@@ -340,40 +596,197 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
                 0.0,
                 cv::INTER_LINEAR);
 
-            std::vector<cv::Mat> channels;
             cv::split(full_flow, channels);
-            channels[0] *=
+            if (channels.size() != 2) {
+                throw std::runtime_error(
+                    "DIS optical flow did not return two channels");
+            }
+            channels.at(0) *=
                 static_cast<float>(pair.first.cols) /
                 static_cast<float>(small_width);
-            channels[1] *=
+            channels.at(1) *=
                 static_cast<float>(pair.first.rows) /
                 static_cast<float>(small_height);
-            return channels;
         };
 
-    const std::vector<cv::Mat> forward_flow_channels =
-        resize_flow_to_full_resolution(flow_small);
+    resize_flow_to_full_resolution(
+        flow_small,
+        cache.forward_flow_full,
+        cache.forward_flow_channels);
 
-    std::vector<cv::Mat> backward_flow_channels;
     if (config_.use_bidirectional_flow) {
+        // As above, do not seed this pair with the previous pair's flow.
         cv::Mat backward_flow_small;
-        auto backward_dis =
-            cv::DISOpticalFlow::create(config_.dis_preset);
-        backward_dis->calc(
-            second_gray, first_gray, backward_flow_small);
-        backward_flow_channels =
-            resize_flow_to_full_resolution(backward_flow_small);
+        cache.backward_dis->calc(
+            cache.second_gray,
+            cache.first_gray,
+            backward_flow_small);
+        resize_flow_to_full_resolution(
+            backward_flow_small,
+            cache.backward_flow_full,
+            cache.backward_flow_channels);
     }
 
-    cv::Mat grid_x(pair.first.rows, pair.first.cols, CV_32FC1);
-    cv::Mat grid_y(pair.first.rows, pair.first.cols, CV_32FC1);
-    for (int y = 0; y < pair.first.rows; ++y) {
-        float* grid_x_row = grid_x.ptr<float>(y);
-        float* grid_y_row = grid_y.ptr<float>(y);
-        for (int x = 0; x < pair.first.cols; ++x) {
-            grid_x_row[x] = static_cast<float>(x);
-            grid_y_row[x] = static_cast<float>(y);
+    if (cache.grid_size != pair.first.size()) {
+        cache.grid_size = pair.first.size();
+        cache.grid_x.create(pair.first.size(), CV_32FC1);
+        cache.grid_y.create(pair.first.size(), CV_32FC1);
+        for (int y = 0; y < pair.first.rows; ++y) {
+            float* grid_x_row = cache.grid_x.ptr<float>(y);
+            float* grid_y_row = cache.grid_y.ptr<float>(y);
+            for (int x = 0; x < pair.first.cols; ++x) {
+                grid_x_row[x] = static_cast<float>(x);
+                grid_y_row[x] = static_cast<float>(y);
+            }
         }
+    }
+
+    if (config_.use_flow_consistency_mask) {
+        const auto build_flow_confidence =
+            [&cache, &pair](
+                const std::vector<cv::Mat>& primary_flow,
+                const std::vector<cv::Mat>& opposite_flow,
+                cv::Mat& confidence) {
+                constexpr double kRelativeConsistencyThreshold = 0.01;
+                constexpr double
+                    kAbsoluteConsistencyThresholdSquared = 0.5;
+                cv::add(
+                    cache.grid_x,
+                    primary_flow.at(0),
+                    cache.consistency_map_x);
+                cv::add(
+                    cache.grid_y,
+                    primary_flow.at(1),
+                    cache.consistency_map_y);
+
+                cv::remap(
+                    opposite_flow.at(0),
+                    cache.sampled_opposite_x,
+                    cache.consistency_map_x,
+                    cache.consistency_map_y,
+                    cv::INTER_LINEAR,
+                    cv::BORDER_CONSTANT,
+                    cv::Scalar(0.0));
+                cv::remap(
+                    opposite_flow.at(1),
+                    cache.sampled_opposite_y,
+                    cache.consistency_map_x,
+                    cache.consistency_map_y,
+                    cv::INTER_LINEAR,
+                    cv::BORDER_CONSTANT,
+                    cv::Scalar(0.0));
+
+                cv::add(
+                    primary_flow.at(0),
+                    cache.sampled_opposite_x,
+                    cache.consistency_error_x);
+                cv::add(
+                    primary_flow.at(1),
+                    cache.sampled_opposite_y,
+                    cache.consistency_error_y);
+                cv::multiply(
+                    cache.consistency_error_x,
+                    cache.consistency_error_x,
+                    cache.consistency_error_squared);
+                cv::multiply(
+                    cache.consistency_error_y,
+                    cache.consistency_error_y,
+                    cache.consistency_threshold_squared);
+                cv::add(
+                    cache.consistency_error_squared,
+                    cache.consistency_threshold_squared,
+                    cache.consistency_error_squared);
+
+                cv::multiply(
+                    primary_flow.at(0),
+                    primary_flow.at(0),
+                    cache.consistency_magnitude_squared);
+                cv::multiply(
+                    primary_flow.at(1),
+                    primary_flow.at(1),
+                    cache.consistency_threshold_squared);
+                cv::add(
+                    cache.consistency_magnitude_squared,
+                    cache.consistency_threshold_squared,
+                    cache.consistency_magnitude_squared);
+                cv::multiply(
+                    cache.sampled_opposite_x,
+                    cache.sampled_opposite_x,
+                    cache.consistency_threshold_squared);
+                cv::add(
+                    cache.consistency_magnitude_squared,
+                    cache.consistency_threshold_squared,
+                    cache.consistency_magnitude_squared);
+                cv::multiply(
+                    cache.sampled_opposite_y,
+                    cache.sampled_opposite_y,
+                    cache.consistency_threshold_squared);
+                cv::add(
+                    cache.consistency_magnitude_squared,
+                    cache.consistency_threshold_squared,
+                    cache.consistency_magnitude_squared);
+                cv::addWeighted(
+                    cache.consistency_magnitude_squared,
+                    kRelativeConsistencyThreshold,
+                    cache.consistency_magnitude_squared,
+                    0.0,
+                    kAbsoluteConsistencyThresholdSquared,
+                    cache.consistency_threshold_squared);
+
+                cv::compare(
+                    cache.consistency_error_squared,
+                    cache.consistency_threshold_squared,
+                    confidence,
+                    cv::CMP_LE);
+
+                cv::compare(
+                    cache.consistency_map_x,
+                    cv::Scalar(0.0),
+                    cache.consistency_valid_x,
+                    cv::CMP_GE);
+                cv::compare(
+                    cache.consistency_map_x,
+                    cv::Scalar(
+                        static_cast<double>(pair.first.cols - 1)),
+                    cache.consistency_valid_y,
+                    cv::CMP_LE);
+                cv::bitwise_and(
+                    cache.consistency_valid_x,
+                    cache.consistency_valid_y,
+                    cache.consistency_valid_x);
+                cv::compare(
+                    cache.consistency_map_y,
+                    cv::Scalar(0.0),
+                    cache.consistency_valid_y,
+                    cv::CMP_GE);
+                cv::bitwise_and(
+                    cache.consistency_valid_x,
+                    cache.consistency_valid_y,
+                    cache.consistency_valid_x);
+                cv::compare(
+                    cache.consistency_map_y,
+                    cv::Scalar(
+                        static_cast<double>(pair.first.rows - 1)),
+                    cache.consistency_valid_y,
+                    cv::CMP_LE);
+                cv::bitwise_and(
+                    cache.consistency_valid_x,
+                    cache.consistency_valid_y,
+                    cache.consistency_valid_x);
+                cv::bitwise_and(
+                    confidence,
+                    cache.consistency_valid_x,
+                    confidence);
+            };
+
+        build_flow_confidence(
+            cache.forward_flow_channels,
+            cache.backward_flow_channels,
+            cache.forward_confidence);
+        build_flow_confidence(
+            cache.backward_flow_channels,
+            cache.forward_flow_channels,
+            cache.backward_confidence);
     }
 
     const std::size_t interval_count =
@@ -381,60 +794,116 @@ DisFrameInterpolator::FrameSequence DisFrameInterpolator::BuildSequence(
 
     FrameSequence sequence;
     sequence.frames.reserve(interval_count);
-    sequence.frame_period =
-        pair.source_interval /
-        static_cast<std::chrono::steady_clock::duration::rep>(
-            interval_count);
-    if (sequence.frame_period <=
-        std::chrono::steady_clock::duration::zero()) {
-        sequence.frame_period =
-            std::chrono::milliseconds(1);
-    }
+    sequence.frame_period = CalculateInterpolatedFramePeriod(
+        pair.source_interval_sum,
+        pair.source_interval_count,
+        config_.intermediate_frame_count);
     sequence.delay_before_first_frame = true;
 
     for (std::size_t k = 1; k < interval_count; ++k) {
         const float alpha =
             static_cast<float>(k) / static_cast<float>(interval_count);
 
-        cv::Mat first_map_x =
-            grid_x - alpha * forward_flow_channels[0];
-        cv::Mat first_map_y =
-            grid_y - alpha * forward_flow_channels[1];
+        cache.first_map_x =
+            cache.grid_x -
+            alpha * cache.forward_flow_channels.at(0);
+        cache.first_map_y =
+            cache.grid_y -
+            alpha * cache.forward_flow_channels.at(1);
 
-        cv::Mat second_map_x;
-        cv::Mat second_map_y;
         if (config_.use_bidirectional_flow) {
-            second_map_x =
-                grid_x -
-                (1.0F - alpha) * backward_flow_channels[0];
-            second_map_y =
-                grid_y -
-                (1.0F - alpha) * backward_flow_channels[1];
+            cache.second_map_x =
+                cache.grid_x -
+                (1.0F - alpha) *
+                    cache.backward_flow_channels.at(0);
+            cache.second_map_y =
+                cache.grid_y -
+                (1.0F - alpha) *
+                    cache.backward_flow_channels.at(1);
         } else {
-            second_map_x =
-                grid_x +
-                (1.0F - alpha) * forward_flow_channels[0];
-            second_map_y =
-                grid_y +
-                (1.0F - alpha) * forward_flow_channels[1];
+            cache.second_map_x =
+                cache.grid_x +
+                (1.0F - alpha) *
+                    cache.forward_flow_channels.at(0);
+            cache.second_map_y =
+                cache.grid_y +
+                (1.0F - alpha) *
+                    cache.forward_flow_channels.at(1);
         }
 
-        cv::Mat warped_first;
-        cv::Mat warped_second;
-        cv::remap(pair.first, warped_first, first_map_x, first_map_y,
-                  cv::INTER_LINEAR, cv::BORDER_CONSTANT,
-                  config_.border_color_bgr);
-        cv::remap(pair.second, warped_second, second_map_x, second_map_y,
-                  cv::INTER_LINEAR, cv::BORDER_CONSTANT,
-                  config_.border_color_bgr);
+        cv::remap(
+            pair.first,
+            cache.warped_first,
+            cache.first_map_x,
+            cache.first_map_y,
+            cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT,
+            config_.border_color_bgr);
+        cv::remap(
+            pair.second,
+            cache.warped_second,
+            cache.second_map_x,
+            cache.second_map_y,
+            cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT,
+            config_.border_color_bgr);
 
         cv::Mat blended;
-        cv::addWeighted(warped_first, 1.0 - alpha,
-                        warped_second, alpha, 0.0, blended);
+        cv::addWeighted(
+            cache.warped_first,
+            1.0 - alpha,
+            cache.warped_second,
+            alpha,
+            0.0,
+            blended);
+
+        if (config_.use_flow_consistency_mask) {
+            cv::remap(
+                cache.forward_confidence,
+                cache.warped_forward_confidence,
+                cache.first_map_x,
+                cache.first_map_y,
+                cv::INTER_NEAREST,
+                cv::BORDER_CONSTANT,
+                cv::Scalar(0.0));
+            cv::remap(
+                cache.backward_confidence,
+                cache.warped_backward_confidence,
+                cache.second_map_x,
+                cache.second_map_y,
+                cv::INTER_NEAREST,
+                cv::BORDER_CONSTANT,
+                cv::Scalar(0.0));
+
+            cv::bitwise_not(
+                cache.warped_backward_confidence,
+                cache.inverse_confidence);
+            cv::bitwise_and(
+                cache.warped_forward_confidence,
+                cache.inverse_confidence,
+                cache.only_first_confident);
+            cv::bitwise_not(
+                cache.warped_forward_confidence,
+                cache.inverse_confidence);
+            cv::bitwise_and(
+                cache.warped_backward_confidence,
+                cache.inverse_confidence,
+                cache.only_second_confident);
+
+            // Prefer the single consistent endpoint at disocclusions. Where
+            // both endpoints agree (or neither is trustworthy), retain the
+            // original blend as the conservative fallback.
+            cache.warped_first.copyTo(
+                blended, cache.only_first_confident);
+            cache.warped_second.copyTo(
+                blended, cache.only_second_confident);
+        }
         sequence.frames.push_back(std::move(blended));
     }
 
-    sequence.frames.push_back(pair.second);
+    // Intermediate frames own their blended buffers already. Only the retained
+    // real endpoint needs a copy before it crosses the display boundary.
+    sequence.frames.push_back(pair.second.clone());
     return sequence;
 }
 
@@ -456,6 +925,11 @@ bool DisFrameInterpolator::PushReadySequence(
     return true;
 }
 
+void DisFrameInterpolator::SetWorkerBusy(bool busy) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    worker_busy_ = busy;
+}
+
 void DisFrameInterpolator::SetStatus(std::string status) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_status_ = std::move(status);
@@ -464,6 +938,22 @@ void DisFrameInterpolator::SetStatus(std::string status) {
 void DisFrameInterpolator::SetError(std::string error) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_error_ = std::move(error);
+}
+
+void DisFrameInterpolator::NotifyReady() {
+    if (!ready_callback_) {
+        return;
+    }
+
+    try {
+        ready_callback_();
+    } catch (const std::exception& error) {
+        SetError(
+            std::string("interpolation ready callback failed: ") +
+            error.what());
+    } catch (...) {
+        SetError("interpolation ready callback failed");
+    }
 }
 
 }  // namespace pointcloud_visualization
