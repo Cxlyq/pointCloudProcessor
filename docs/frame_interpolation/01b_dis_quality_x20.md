@@ -23,7 +23,10 @@ interpolation_intermediate_frames: 19
 interpolation_flow_scale: 0.5
 interpolation_dis_preset: "ultrafast"
 interpolation_bidirectional_flow: false
-interpolation_display_queue_depth: 10
+interpolation_timing_source: "message_stamp"
+interpolation_pending_pair_capacity: 3
+interpolation_ready_sequence_capacity: 2
+interpolation_highgui_event_mode: "poll_key"
 ```
 
 19 张中间帧复用同一份光流，不会执行 19 次光流计算。相对基础版，新增开销主要来自：
@@ -60,9 +63,9 @@ ros2 launch visualization v_dis_ultrafast.launch.py
 ## 试用时记录
 
 - 日志中一对真实帧生成 19 张中间帧的耗时；
-- `[TX]` 的发布频率是否接近预期；
-- `[FPS] Display` 的 `received`、`presented` 与 `max display gap` 是否解释体感；
-- `missing`、FIFO 深度、反压次数和 HighGUI 最大耗时是否出现异常；
+- `[SRC-TX]` 与 `[FPS] Display` 的 `source RX` 是否一致；
+- `[FPS] Display` 的 `presented` 与 `max display gap` 是否解释体感；
+- `missing`、本地队列、反压时间和 HighGUI 最大耗时是否出现异常；
 - 插值轮廓是否比基础版清晰；
 - 插值画面是否仍有双边或拖影；
 - 实际显示是否接近原始帧数的 20 倍；

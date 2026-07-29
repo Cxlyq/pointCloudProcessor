@@ -1,96 +1,78 @@
-# 阶段 2：双向 DIS
+# 阶段 2：双向 DIS ×5
 
-状态：已实现，可试用。
+状态：当前统一使用的可视化插帧方案。
 
-## 进入条件
+## 算法
 
-只有阶段 1 出现以下现象时再实现：
-
-- 目标边缘存在明显双影；
-- 前景和背景交界处向错误方向拉伸；
-- 从画面中出现或消失的区域产生大面积拖影。
-
-## 方案
-
-每对真实渲染图分别计算：
+对每对真实渲染图计算两个方向的光流：
 
 ```text
 F01 = DIS(I0, I1)
 F10 = DIS(I1, I0)
 ```
 
-两张图分别使用各自方向的流场变形到中间时刻，再进行融合。当前第一版先使用真实
-双向流替代阶段 1 的反向近似，并可选计算前后向一致性掩码。当前双向配置继续启用该
-掩码；本次连续性修复不改变这一既有画质策略。
+两张端点图分别使用对应方向的流场变形到中间时刻，再线性融合。当前
+配置同时启用前后向一致性掩码：
 
-该功能只在 `interpolation_flow_consistency_mask: true` 时执行额外的全分辨率检查，
-单向和 x20 配置默认关闭，不增加它们的计算量。掩码必须与
-`interpolation_bidirectional_flow: true` 同时使用，否则节点会在启动时拒绝配置。
-
-## 修改范围
-
-仍然只修改：
-
-- `src/visualization/include/visualization/dis_frame_interpolator.hpp`
-- `src/visualization/src/dis_frame_interpolator.cpp`
-- `src/visualization/src/visualization_node.cpp`
-- `src/visualization/src/interpolation_display_node.cpp`
-- `src/visualization/config/v_dis_bidirectional_config.yaml`
-- `src/visualization/launch/v_dis_bidirectional.launch.py`
-
-ROS 消息、重建和其他节点保持不变。
-
-## 构建与调用
-
-重新构建并加载工作空间：
-
-```bash
-colcon build --packages-up-to visualization
-source install/setup.bash
+```yaml
+interpolation_intermediate_frames: 4
+interpolation_flow_scale: 0.25
+interpolation_dis_preset: "ultrafast"
+interpolation_bidirectional_flow: true
+interpolation_flow_consistency_mask: true
 ```
 
-其他流水线节点仍分别使用原来的 launch。可视化节点改用：
+一致性掩码属于既有画质策略，本次连续性修改不改变其行为。
+
+## 进程边界
+
+`visualization_node` 只负责 Open3D 网格更新、真实帧渲染和源图发布。
+`interpolation_display_node` 接收真实帧后，在本进程的 worker 中完成
+双向 DIS，并由显示主线程按顺序消费全部中间帧。
+
+DDS 话题为：
+
+```text
+interpolation_source_frames/<camera_id>
+```
+
+发布和订阅均使用 `reliable + KeepAll`。×5 后的中间 BGR 图不再经过
+DDS，因此避免让大尺寸图像发布链和显示 FIFO 成为额外瓶颈。
+
+## 连续性
+
+本地队列使用严格顺序和阻塞反压：
+
+```yaml
+interpolation_pending_pair_capacity: 3
+interpolation_ready_sequence_capacity: 2
+```
+
+当 pending 已满，新的源帧提交等待 worker 腾出位置；不会把多个相邻
+源帧对合并。当 ready 已满，worker 等待显示端完成前面的序列；不会
+删除完整序列。显示调度即使迟到也只取下一张帧，不通过跳帧追赶。
+
+因此过载时的可见结果应为播放变慢、延迟和反压上升，而不是从一段中间
+帧突然跳到后续真实帧。
+
+## 构建与启动
 
 ```bash
+colcon build --packages-select visualization \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ros2 launch visualization v_dis_bidirectional.launch.py
 ```
 
-默认只显示一个双向 DIS 插值窗口，Open3D 源渲染窗口保持隐藏。
-
-默认同样在每两个真实帧之间插入 4 张虚拟帧，并根据真实帧间隔自动确定播放步长。
-仍使用 1/4 分辨率和 `ULTRAFAST`，用于先比较双向流与单向流的差异。若生成时间明显
-低于真实帧间隔但轮廓仍不稳定，可把配置改成：
-
-```yaml
-interpolation_flow_scale: 0.5
-interpolation_dis_preset: "fast"
-```
-
-该入口使用独立的 `interpolation_display_node` 显示进程。发布与订阅均使用
-`reliable + KeepAll`，显示回调将收到的帧按序放入深度 10 的 FIFO；队列满时向发布端
-反压，而不是覆盖旧帧。ROS 接收线程不会被
-HighGUI 的事件处理阻塞。输出调度迟到时一次只提交当前帧，并从实际提交时刻安排
-下一帧，不再跳过中间帧或重置到最新真实帧。
-
-## 计算开销
-
-- 每对真实帧计算两次低分辨率 DIS；
-- 每张中间帧仍以两次 Warp 和一次融合为主；
-- 启用一致性掩码后，每对真实帧增加两次流场往返检查，每张中间帧增加两次单通道
-  掩码 Warp；
-- 同一分辨率下，DIS 实例、坐标网格和 Warp 临时缓冲会在线程内复用，避免每对真实
-  帧重复构造和分配；分辨率变化时会重建 DIS 实例，输出帧缓冲始终独立持有，不能与
-  缓存复用；
-- 相较阶段 1，双向光流估计部分约增加一倍，一致性掩码还会增加一部分全分辨率开销。
+完整的日志解释和现场测试要求见
+[可视化插帧方案说明](README.md)。
 
 ## 验收重点
 
-- 阶段 1 中的边缘重影是否减少；
-- CPU 增量是否影响上游重建；
-- 双向光流和 4 张中间帧能否在下一个真实帧到达前完成；
-- 输出帧数是否约为原始帧数的 5 倍；
-- 开启/关闭 `interpolation_flow_consistency_mask` 时，遮挡边界重影是否确实改善；
-- 遮挡区域是否仍有需要深度信息解决的问题。
-
-当前仍使用双线性 Warp，且一致性掩码只在“仅一端可信”时替换线性融合。若启用后
-遮挡边界仍模糊，再进入带软权重的遮挡处理或阶段 3，而不是继续提高输出帧数。
+- `source missing = 0`、`out-of-order = 0`；
+- `display sequence breaks = 0`；
+- `[GEN]` 中源帧对连续，例如 `#12->#13`、`#13->#14`；
+- 长期 `presented ≈ source RX × 5`；
+- 正常负载下 pending/ready 不长期占满；
+- `imshow` 和 event 耗时没有持续数百毫秒；
+- 主观观察无整段跳变，且延迟不持续无界增长。

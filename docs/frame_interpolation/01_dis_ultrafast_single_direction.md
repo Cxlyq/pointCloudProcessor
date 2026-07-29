@@ -19,8 +19,8 @@ DIS 预设：ULTRAFAST
 光流方向：I0 -> I1，一次
 ```
 
-光流仍只在可视化包内部处理；按时到期的中间画面通过包内使用的
-`sensor_msgs/Image` 话题发送给独立显示进程。
+光流仍只在可视化包内部处理。`visualization_node` 只把真实渲染帧通过
+`sensor_msgs/Image` 发送给独立显示进程；中间画面在显示进程本地生成和消费。
 
 ## 实现文件
 
@@ -31,8 +31,9 @@ DIS 预设：ULTRAFAST
   - 仅在真实网格到达时渲染一次源画面，避免持续重绘阻塞插值播放。
 - `src/visualization/src/interpolation_display_node.cpp`
   - 在独立 ROS 2 进程的主线程创建和更新 HighGUI 窗口；
-  - ROS 接收线程与 HighGUI 主线程分离，使用 reliable DDS 和有界 FIFO 保序；
-  - 恢复 `startWindowThread()` 事件处理，后端不支持时才回退到 `waitKey()`。
+  - ROS 接收线程与 HighGUI 主线程分离，DDS 只传真实源帧；
+  - 本地 worker 生成完整插值序列，主线程按顺序逐帧消费；
+  - 默认使用主线程 `pollKey()` 并记录 HighGUI 阻塞耗时。
 - `src/visualization/src/dis_frame_interpolator.cpp`
   - 后台线程计算低分辨率 DIS；
   - 将光流放大并按实际宽高比例修正位移；
@@ -96,8 +97,10 @@ Open3D 窗口仍作为源画面的渲染器存在，但默认隐藏，而且只�
 | `interpolation_dis_preset` | `ultrafast` | `ultrafast`、`fast` 或 `medium` |
 | `interpolation_bidirectional_flow` | `false` | 保持阶段 1 的单向光流 |
 | `interpolation_flow_consistency_mask` | `false` | 仅双向流可用；阶段 1 保持关闭 |
-| `interpolation_timing_source` | `arrival` | 使用真实帧到达间隔计算播放步长 |
-| `interpolation_display_queue_depth` | `10` | 显示进程 FIFO 深度；满时通过 reliable DDS 反压 |
+| `interpolation_timing_source` | `message_stamp` | 使用发布端源帧时间戳计算播放步长 |
+| `interpolation_pending_pair_capacity` | `3` | 待生成源帧对容量；满时阻塞反压，不合并帧对 |
+| `interpolation_ready_sequence_capacity` | `2` | 已生成完整序列容量；满时等待显示端，不删除序列 |
+| `interpolation_highgui_event_mode` | `poll_key` | 在显示主线程处理并测量 HighGUI 事件 |
 | `interpolation_lock_camera` | `true` | 每张真实网格都恢复相同相机 |
 | `interpolation_show_source_window` | `false` | 是否显示仅用于调试的 Open3D 源窗口 |
 
@@ -123,8 +126,9 @@ ros2 launch visualization v_vis.launch.py
 - 日志是否显示 `Single-direction DIS interpolation enabled`；
 - 第二张真实网格到达后是否开始平滑播放；
 - `[GEN]` 是否显示生成 4 张中间显示帧及其总耗时；
-- `[TX]` 发布频率与 `[FPS] Display` 的 `received`、`presented` 是否一致；
-- `max display gap`、`missing`、FIFO 深度、反压次数和 HighGUI 最大耗时是否解释体感；
+- `[SRC-TX]` 与 `[FPS] Display` 的 `source RX` 是否一致；
+- `presented` 是否接近 `source RX × 5`；
+- `max display gap`、`missing`、本地队列、反压时间和 HighGUI 耗时是否解释体感；
 - 实际显示帧数是否约为原始方式的 5 倍；
 - 轮廓是否出现明显双影、拉伸或反方向移动；
 - 光流计算期间 Open3D 和 ROS 是否仍能响应；
