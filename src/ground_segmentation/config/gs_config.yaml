@@ -20,3 +20,8 @@ gmz_node:
     # GMZ 算法参数
     grid_size: 20.0
     height_threshold: 0.8
+    # 保存点云功能
+    data_saved_dir: "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/01/ground_points/"
+    enable_sparse_ground_points_saving: false
+    enable_ground_points_saving: false
+    enable_non_ground_points_saving: false

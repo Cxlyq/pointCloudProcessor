@@ -128,16 +128,16 @@ def evaluate_mesh_vs_geotiff(mesh_path, tiff_path, gps_lat, gps_lon, gps_alt, ya
 
 if __name__ == "__main__":
     # 请填入真实测试数据
-    MESH_FILE = "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/01/terrain_1784791239_354090874.ply"
+    MESH_FILE = "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/03/terrain_1784873715_215031351.ply"
     TIFF_FILE = "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/GeoInfo/Wild/01/n18_e109_1arc_v3.tif"
-    SAVE_DIR = "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/01/evaluated_mesh"
+    SAVE_DIR = "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/03/evaluated_mesh"
     # 白模原点(0,0,0)对应的真实 GPS 坐标及海拔
-    GPS_LAT = 18.262357711791992
-    GPS_LON = 109.554809570312500
-    GPS_ALT = 572.500000000000000
+    GPS_LAT = 18.265754699707031
+    GPS_LON = 109.609924316406250
+    GPS_ALT = 209.000000000000000
 
     # 局部坐标系 X 轴相对于正北方向的角度 (根据你的里程计/IMU校准)
-    YAW_DEGREES = -135.428466796875000
+    YAW_DEGREES = -15.661010742187500
 
     try:
         evaluate_mesh_vs_geotiff(MESH_FILE, TIFF_FILE, GPS_LAT, GPS_LON, GPS_ALT, YAW_DEGREES, SAVE_DIR)

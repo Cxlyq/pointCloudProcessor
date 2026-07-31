@@ -1,7 +1,7 @@
 # 模拟雷达数据流节点的配置
 sim_lidar_data_flow_node:
   ros__parameters:
-    dataset_dir: "/home/cx/Documents/codes/pointcloud_607/dataset/pointCloud/data1/Wild/01"
+    dataset_dir: "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/PCData/Wild/01/RadialShear/OutlierFilter"
     publish_rate: 2.0
     publish_topic: "/io/raw_pointcloud"
     frame_id: "map"

@@ -29,12 +29,21 @@ public:
         this->declare_parameter<double>("grid_size", 5.0);
         this->declare_parameter<double>("height_threshold", 0.3);
 
+        this->declare_parameter<std::string>("data_saved_dir", "/home");
+        this->declare_parameter<bool>("enable_sparse_ground_points_saving", false);
+        this->declare_parameter<bool>("enable_ground_points_saving", false);
+        this->declare_parameter<bool>("enable_non_ground_points_saving", false);
+
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto pub_g_topic = this->get_parameter("publish_ground_topic").as_string();
         auto pub_ng_topic = this->get_parameter("publish_non_ground_topic").as_string();
 
         grid_size_ = this->get_parameter("grid_size").as_double();
         height_threshold_ = this->get_parameter("height_threshold").as_double();
+        data_saved_dir_ = this->get_parameter("data_saved_dir").as_string();
+        enable_sparse_ground_points_saving_ = this->get_parameter("enable_sparse_ground_points_saving").as_bool();
+        enable_ground_points_saving_ = this->get_parameter("enable_ground_points_saving").as_bool();
+        enable_non_ground_points_saving_ = this->get_parameter("enable_non_ground_points_saving").as_bool();
 
         // 2. 创建订阅者与发布者
         subscription_ = this->create_subscription<pc_msgs::msg::O3DPointCloud>(
@@ -130,6 +139,7 @@ private:
 
         // 3.3 第二遍遍历：根据最低点 + 阈值剔除所有附着在地面的点，只保留悬浮的非地面点用于聚类
         auto non_ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
+        auto ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
 
         // 预分配内存，提升速度
         non_ground_pcd->points_.reserve(num_points);
@@ -150,6 +160,9 @@ private:
             if (pt.z() > (min_z + height_threshold_)) {
                 non_ground_pcd->points_.push_back(pt);
                 if (has_colors) non_ground_pcd->colors_.push_back(pcd->colors_[i]);
+            }else{
+                ground_pcd->points_.push_back(pt);
+                if (has_colors) ground_pcd->colors_.push_back(pcd->colors_[i]);
             }
         }
 
@@ -209,11 +222,41 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "[*] GMZ Segmented! Ground: %zu, Non-Ground: %zu, Waiting for reconstruction: %zu. Time: %.2f ms",
                     pcd->points_.size()-non_ground_pcd->points_.size(), non_ground_pcd->points_.size(), sparse_ground_pcd->points_.size(), elapsed_ms);
+
+
+        // 本地文件保存 (.ply)
+        if (!data_saved_dir_.empty()) {
+            // 利用 ROS 消息时间戳作为文件名唯一标识
+            std::string timestamp = std::to_string(msg->header.stamp.sec) + "_" +
+                                    std::to_string(msg->header.stamp.nanosec);
+
+            // 保存重建地面点
+            if (enable_sparse_ground_points_saving_ && sparse_ground_pcd) {
+                std::string file_path = data_saved_dir_ + "sparse_gpcd_" + timestamp + ".ply";
+                open3d::io::WritePointCloud(file_path, *sparse_ground_pcd);
+            }
+
+            // 保存全量地面点
+            if (enable_ground_points_saving_ && ground_pcd) {
+                std::string file_path = data_saved_dir_ + "full_gpcd_" + timestamp + ".ply";
+                open3d::io::WritePointCloud(file_path, *ground_pcd);
+            }
+
+            // 保存无地面点
+            if (enable_non_ground_points_saving_ && non_ground_pcd) {
+                std::string file_path = data_saved_dir_ + "nongpcd_" + timestamp + ".ply";
+                open3d::io::WritePointCloud(file_path, *non_ground_pcd);
+            }
+        }
     }
 
     // 算法参数
     double grid_size_;
     double height_threshold_;
+    bool enable_ground_points_saving_;
+    bool enable_non_ground_points_saving_;
+    bool enable_sparse_ground_points_saving_;
+    std::string data_saved_dir_;
 
     // ROS 对象
     rclcpp::Subscription<pc_msgs::msg::O3DPointCloud>::SharedPtr subscription_;
