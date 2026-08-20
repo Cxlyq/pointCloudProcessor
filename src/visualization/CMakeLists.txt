@@ -11,11 +11,19 @@ find_package(rclcpp REQUIRED)
 find_package(pc_msgs REQUIRED)
 find_package(Threads REQUIRED) # 线程库
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc video)
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
 find_package(Open3D REQUIRED)
 
+if(UNIX AND NOT APPLE)
+  find_package(X11 REQUIRED)
+endif()
 
-add_executable(visualization_node src/visualization_node.cpp)
+add_executable(visualization_node
+        src/visualization_node.cpp
+        src/dis_frame_interpolator.cpp
+        src/native_frame_window.cpp
+)
 
 target_include_directories(visualization_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -23,11 +31,29 @@ target_include_directories(visualization_node PUBLIC
 target_include_directories(visualization_node PUBLIC
         ${Open3D_INCLUDE_DIRS}
         ${EIGEN3_INCLUDE_DIRS}
+        ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(visualization_node
         ${Open3D_LIBRARIES}
+        ${OpenCV_LIBS}
         Threads::Threads
 )
+if(WIN32)
+  target_link_libraries(visualization_node
+          user32
+          gdi32
+  )
+elseif(UNIX AND NOT APPLE)
+  target_compile_definitions(visualization_node PRIVATE
+          VISUALIZATION_NATIVE_X11=1
+  )
+  target_include_directories(visualization_node PRIVATE
+          ${X11_INCLUDE_DIR}
+  )
+  target_link_libraries(visualization_node
+          ${X11_LIBRARIES}
+  )
+endif()
 target_compile_features(visualization_node PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 ament_target_dependencies(
   visualization_node

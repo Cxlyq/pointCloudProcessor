@@ -1,0 +1,29 @@
+visualization_node:
+  ros__parameters:
+    subscribe_topic: "/reconstruction/white_mesh"
+    camera_ids: ["cam_front"]
+    fps_logging_enabled: true
+    fps_logging_interval_sec: 5.0
+
+    interpolation_enabled: true
+    interpolation_intermediate_frames: 4
+    interpolation_flow_scale: 0.25
+    interpolation_dis_preset: "ultrafast"
+    interpolation_bidirectional_flow: true
+    interpolation_timing_source: "arrival"
+    interpolation_lock_camera: true
+    interpolation_show_source_window: false
+    interpolation_display_backend: "auto"
+    interpolation_diagnostic_overlay: false
+    interpolation_window_suffix: " - Bidirectional DIS x5"
+
+    cam_front:
+      name: "Real-time Render - Front View"
+      width: 800
+      height: 600
+      background_color: [0.1, 0.1, 0.1]
+      point_size: 2.0
+      front: [-0.0, -1.0, 0.35]
+      lookat: [-17.5, 2213.0, -86.0]
+      up: [-0.0, 0.35, 1.0]
+      zoom: 0.7
