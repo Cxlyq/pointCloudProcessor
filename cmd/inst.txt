@@ -1,0 +1,21 @@
+# compile
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-select [...] --symlink-install
+
+# source
+source install/setup.zsh
+
+# io
+ros2 launch io_handlers io_simLidarDataFlow.launch.py
+
+# ground
+ros2 launch ground_segmentation gs_gmz.launch.py
+
+# clustering
+ros2 launch clustering c_pdbscan.launch.py
+
+# reconstruction
+ros2 launch reconstruction r_g_poisson_ng_obb.launch.py
+
+# visualization
+ros2 launch visualization v_dis_bidirectional.launch.py
