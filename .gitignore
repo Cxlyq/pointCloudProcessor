@@ -4,4 +4,5 @@ install/
 log/
 cmake-build-debug/
 dataset/
-
+*.glb
+*.ply

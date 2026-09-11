@@ -51,7 +51,7 @@ reconstruction_g_poisson_ng_obb_node:
     normal_radius: 20.0
     normal_max_nn: 15
     # 保存白模功能
-    data_saved_dir: "/home/cx/Documents/codes/pointcloud_607_roscpp/dataset/result/Wild/01"
-    enable_terrain_mesh_saving: true
+    data_saved_dir: "/home/asahichinn/Documents/codes/pointCloudProcessor/dataset/result/Wild/01"
+    enable_terrain_mesh_saving: false
     enable_architecture_mesh_saving: false
     enable_combined_mesh_saving: false
