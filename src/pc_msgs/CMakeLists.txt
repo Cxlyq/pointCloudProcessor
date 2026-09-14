@@ -15,11 +15,19 @@ set(msg_files
         "msg/ClusteredPointCloud.msg"
         "msg/O3DMesh.msg"
         "msg/O3DPointCloud.msg"
+        "msg/PlaneState.msg"
+        "msg/PowerTowerGPS.msg"
+)
+
+# List all srv
+set(srv_files
+        "srv/QueryNearbyTowers.srv"
 )
 
 # generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
         ${msg_files}
+        ${srv_files}
         DEPENDENCIES std_msgs
 )
 

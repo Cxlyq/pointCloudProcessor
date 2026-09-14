@@ -1,0 +1,15 @@
+# QueryNearbyTowers.srv
+# Service 定义：上游节点提供载机的当前经纬度，
+# 本节点返回附近一定距离内的所有高压塔 GPS 信息
+#
+# 请求 (Request)：仅经纬度字段有效
+float64 latitude    # 载机当前纬度 (度, WGS84)
+float64 longitude   # 载机当前经度 (度, WGS84)
+float64 radius_km   # 查询半径 (千米)，若为 0 则使用服务端默认值
+---
+# 响应 (Response)：直接展开高压塔的经纬高信息（与 PowerTowerGPS.msg 一致）
+float64[] latitudes   # 纬度数组，索引 i 对应第 i 座高压塔的纬度
+float64[] longitudes  # 经度数组，索引 i 对应第 i 座高压塔的经度
+float64[] altitudes   # 高度数组，索引 i 对应第 i 座高压塔的高度
+bool success                  # 查询是否成功
+string message                # 附加信息（例如错误描述）
