@@ -14,7 +14,10 @@ find_package(pc_msgs REQUIRED)
 list(APPEND CMAKE_PREFIX_PATH "/usr/local")
 find_package(Open3D REQUIRED)
 
-# 添加可执行文件
+# 寻找 nlohmann_json（用于解析 JSON 配置文件）
+# find_package(nlohmann_json REQUIRED)
+
+# ── 添加可执行文件：sim_lidar_data_flow_node ──────────────────
 add_executable(sim_lidar_data_flow_node src/sim_lidar_data_flow_node.cpp)
 
 # 包含 Open3D 的目录并链接库
@@ -28,9 +31,26 @@ ament_target_dependencies(
   "pc_msgs"
 )
 
-# 安装可执行文件
+# ── 添加可执行文件：sim_plane_data_flow_node ──────────────────
+add_executable(sim_plane_data_flow_node src/sim_plane_data_flow_node.cpp)
+
+target_include_directories(sim_plane_data_flow_node PUBLIC ${Open3D_INCLUDE_DIRS})
+target_link_libraries(sim_plane_data_flow_node
+        ${Open3D_LIBRARIES}
+        #nlohmann_json::nlohmann_json
+)
+target_compile_features(sim_plane_data_flow_node PUBLIC c_std_99 cxx_std_17)
+
+ament_target_dependencies(
+  sim_plane_data_flow_node
+  "rclcpp"
+  "pc_msgs"
+)
+
+# ── 安装可执行文件 ──────────────────────────────────────────────
 install(TARGETS
         sim_lidar_data_flow_node
+        sim_plane_data_flow_node
         DESTINATION lib/${PROJECT_NAME}
 )
 

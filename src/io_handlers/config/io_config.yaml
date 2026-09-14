@@ -7,7 +7,22 @@ sim_lidar_data_flow_node:
     frame_id: "map"
     is_loop: true
 
-# 未来其他功能的配置预留 (示例)
-# some_other_io_node:
-#   ros__parameters:
-#     another_param: 123
+# 模拟载机综合数据流节点的配置
+sim_plane_data_flow_node:
+  ros__parameters:
+    # 数据集根目录，需包含 extend_data.json 和 powerLineGPS.json
+    dataset_dir: "/home/asahichinn/Documents/codes/pointCloudProcessor/dataset/Wild/04"
+    # 点云 + 载机状态发布频率 (Hz)
+    publish_rate: 2.0
+    # 发布点云的 topic
+    pointcloud_topic: "/io/plane/raw_pointcloud"
+    # 发布载机状态 (PlaneState) 的 topic
+    plane_state_topic: "/io/plane/state"
+    # 高压塔查询 Service 名称
+    query_service_name: "/io/query_nearby_towers"
+    # 坐标系 frame_id
+    frame_id: "map"
+    # 是否循环发布（false = 发完即停）
+    is_loop: false
+    # 默认查询半径（千米），请求中 radius_km <= 0 时使用此值
+    default_query_radius_km: 5.0
