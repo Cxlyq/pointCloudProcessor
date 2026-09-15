@@ -55,3 +55,58 @@ reconstruction_g_poisson_ng_obb_node:
     enable_terrain_mesh_saving: false
     enable_architecture_mesh_saving: false
     enable_combined_mesh_saving: false
+
+reconstruction_g_poisson_ng_obb_pt_node:
+  ros__parameters:
+    # 点云订阅 topic
+    sub_ground_topic: "/gs/ground_pointcloud"
+    sub_cluster_topic: "/clustering/clustered_pointcloud"
+    # 白模发布 topic
+    pub_mesh_topic: "/reconstruction/white_mesh"
+    # 重建参数（同 obb 节点）
+    min_cluster_size: 15
+    poisson_depth: 6
+    density_quantile: 0.06
+    normal_radius: 20.0
+    normal_max_nn: 15
+    # 白模保存功能
+    data_saved_dir: "/home/asahichinn/Documents/codes/pointCloudProcessor/dataset/result/Wild/04"
+    enable_terrain_mesh_saving: false
+    enable_architecture_mesh_saving: false
+    enable_combined_mesh_saving: false
+    # 载机状态 topic（来自 sim_plane_data_flow_node）
+    # 与 io_handlers/config/io_config.yaml 中 plane_state_topic 保持一致
+    sub_plane_state_topic: "/io/plane/state"
+    # 高压塔查询 Service 名称（来自 sim_plane_data_flow_node）
+    # 与 io_handlers/config/io_config.yaml 中 query_service_name 保持一致
+    tower_query_service: "/io/query_nearby_towers"
+    # ── 查询半径（千米），0 表示使用 io_handlers 侧的默认值 ───────────────
+    tower_query_radius_km: 5.0
+
+    # ── 三路同步器容错时间（秒）──────────────────────────────────────────
+    # 上游三路消息共享同一时间戳，此处设较小值作安全冗余；设置过大会引入帧错位
+    sync_slop_sec: 0.05
+    # 高压塔 .ply 模型路径（节点启动时一次性载入内存）
+    # 请修改为实际模型路径
+    tower_model_path: "/home/asahichinn/Documents/codes/pointCloudProcessor/assets/power-transmission-tower/powerTransmissionTower_optimized9.ply"
+    # 高压塔模型缩放比例（1.0 = 不缩放）
+    tower_model_scale: 1.0
+    # 高压塔模型颜色 RGB（0.0~1.0）
+    tower_model_color: [0.8, 0.5, 0.1]
+    # 高压塔模型旋转矩阵（行优先，3×3 展开为 9 个元素）
+    # 含义：插入模型前，先将模型顶点乘以此矩阵再平移到目标位置
+    # 默认值为单位矩阵（不旋转）；
+    # 示例：绕 Z 轴旋转 90°:
+    #   [0, -1, 0,
+    #    1,  0, 0,
+    #    0,  0, 1]
+    tower_model_rotation_deg:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
