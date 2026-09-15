@@ -7,6 +7,8 @@ source install/setup.zsh
 
 # io
 ros2 launch io_handlers io_simLidarDataFlow.launch.py
+[option] 带有模拟发送飞机飞行位置状态的io节点
+ros2 launch io_handlers io_simPlaneDataFlow.launch.py
 
 # ground
 ros2 launch ground_segmentation gs_gmz.launch.py
@@ -16,6 +18,8 @@ ros2 launch clustering c_pdbscan.launch.py
 
 # reconstruction
 ros2 launch reconstruction r_g_poisson_ng_obb.launch.py
+[option]带有获取并插入高压塔模型功能的白模重建节点
+ros2 launch reconstruction r_g_poisson_ng_obb_pt.launch.py
 
 # visualization
 ros2 launch visualization v_dis_bidirectional.launch.py
