@@ -22,12 +22,15 @@ public:
         this->declare_parameter<std::string>("publish_topic", "/clustering/clustered_pointcloud");
 
         this->declare_parameter<double>("r_ref", 2000.0);
-        this->declare_parameter<double>("r_weight", 1.0);
+        this->declare_parameter<double>("r_weight", 3.5);
         this->declare_parameter<double>("theta_weight", 1.0);
         this->declare_parameter<double>("phi_weight", 1.0);
 
-        this->declare_parameter<double>("cluster_eps", 20.0);
+        this->declare_parameter<double>("cluster_eps", 8.0);
         this->declare_parameter<int>("cluster_min_samples", 5);
+        this->declare_parameter<int>("cluster_max_samples", 3000);
+        this->declare_parameter<double>("max_cluster_extent", 150.0);
+        this->declare_parameter<bool>("enable_range_balancing", true);
 
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto pub_topic = this->get_parameter("publish_topic").as_string();
@@ -38,6 +41,9 @@ public:
         phi_weight_ = this->get_parameter("phi_weight").as_double();
         cluster_eps_ = this->get_parameter("cluster_eps").as_double();
         cluster_min_samples_ = this->get_parameter("cluster_min_samples").as_int();
+        cluster_max_samples_ = this->get_parameter("cluster_max_samples").as_int();
+        max_cluster_extent_ = this->get_parameter("max_cluster_extent").as_double();
+        enable_range_balancing_ = this->get_parameter("enable_range_balancing").as_bool();
 
         // 2. 创建订阅者与发布者
         subscription_ = this->create_subscription<pc_msgs::msg::O3DPointCloud>(
@@ -46,7 +52,8 @@ public:
 
         publisher_ = this->create_publisher<pc_msgs::msg::ClusteredPointCloud>(pub_topic, 10);
 
-        RCLCPP_INFO(this->get_logger(), "[*] Clustering node has been brought up. Listening on: %s", sub_topic.c_str());
+        RCLCPP_INFO(this->get_logger(), "[*] Clustering node brought up. Max points cap: %d, Max extent: %.1fm",
+                    cluster_max_samples_, max_cluster_extent_);
     }
 
 private:
@@ -59,8 +66,7 @@ private:
 
         size_t num_points = msg->points.size() / 3;
 
-        // 2 & 3. 特征工程：将笛卡尔坐标转换为加权极坐标空间（利用弧长公式进行物理量纲统一归一化）
-        // 我们创建一个 "虚拟点云"，将其 X, Y, Z 替换为归一化且加权后的 r, theta, phi 特征
+        // 2 & 3. 特征工程：极坐标特征物理量纲对齐与距离密度平衡
         auto feature_pcd = std::make_shared<open3d::geometry::PointCloud>();
         feature_pcd->points_.reserve(num_points);
 
@@ -69,15 +75,17 @@ private:
             double y = msg->points[i * 3 + 1];
             double z = msg->points[i * 3 + 2];
 
-            double r = std::hypot(x, y, z); // std::hypot 计算 sqrt(x^2 + y^2 + z^2) 且防止溢出
+            double r = std::hypot(x, y, z);
             double theta = std::atan2(y, x);
             double r_safe = std::max(r, 1e-6);
             double phi = std::asin(z / r_safe);
 
-            // 动态局部弧长归一化：将每个点的角度乘以该点的实际距离 r_safe，使切向物理距离 1:1 对齐真实物理米数
+            // 距离密度平衡缩放：在远端平衡点云稀疏度，在近端拉开特征间距
+            double effective_r = enable_range_balancing_ ? std::sqrt(r_safe * r_ref_) : r_safe;
+
             double r_meter = r;
-            double theta_meter = r_safe * theta;
-            double phi_meter = r_safe * phi;
+            double theta_meter = effective_r * theta;
+            double phi_meter = effective_r * phi;
 
             // 存入虚拟点云
             feature_pcd->points_.emplace_back(
@@ -88,13 +96,74 @@ private:
         }
 
         // 4. 执行 DBSCAN 聚类
-        // C++ API: ClusterDBSCAN(eps, min_points, print_progress)
         std::vector<int> labels;
         try {
             labels = feature_pcd->ClusterDBSCAN(cluster_eps_, cluster_min_samples_, false);
         } catch (const std::exception& e) {
             RCLCPP_ERROR(this->get_logger(), "[!] Failed to clustering: %s", e.what());
             return;
+        }
+
+        // 4.5 过滤超标巨型团 (基于最大点数 cluster_max_samples_ 与最大外接盒尺寸 max_cluster_extent_)
+        if (!labels.empty() && (cluster_max_samples_ > 0 || max_cluster_extent_ > 0.0)) {
+            std::vector<size_t> cluster_counts;
+            std::vector<double> min_x, max_x, min_y, max_y, min_z, max_z;
+
+            int current_max = *std::max_element(labels.begin(), labels.end());
+            if (current_max >= 0) {
+                size_t num_labels = current_max + 1;
+                cluster_counts.resize(num_labels, 0);
+                min_x.resize(num_labels, 1e9); max_x.resize(num_labels, -1e9);
+                min_y.resize(num_labels, 1e9); max_y.resize(num_labels, -1e9);
+                min_z.resize(num_labels, 1e9); max_z.resize(num_labels, -1e9);
+
+                for (size_t i = 0; i < num_points; ++i) {
+                    int label = labels[i];
+                    if (label < 0) continue;
+
+                    cluster_counts[label]++;
+
+                    double x = msg->points[i * 3 + 0];
+                    double y = msg->points[i * 3 + 1];
+                    double z = msg->points[i * 3 + 2];
+
+                    min_x[label] = std::min(min_x[label], x);
+                    max_x[label] = std::max(max_x[label], x);
+                    min_y[label] = std::min(min_y[label], y);
+                    max_y[label] = std::max(max_y[label], y);
+                    min_z[label] = std::min(min_z[label], z);
+                    max_z[label] = std::max(max_z[label], z);
+                }
+
+                // 标记超标类别
+                std::vector<bool> is_invalid(num_labels, false);
+                for (size_t l = 0; l < num_labels; ++l) {
+                    if (cluster_counts[l] == 0) continue;
+
+                    if (cluster_max_samples_ > 0 && cluster_counts[l] > static_cast<size_t>(cluster_max_samples_)) {
+                        is_invalid[l] = true;
+                        continue;
+                    }
+
+                    if (max_cluster_extent_ > 0.0) {
+                        double dx = max_x[l] - min_x[l];
+                        double dy = max_y[l] - min_y[l];
+                        double dz = max_z[l] - min_z[l];
+                        double max_extent = std::max({dx, dy, dz});
+                        if (max_extent > max_cluster_extent_) {
+                            is_invalid[l] = true;
+                        }
+                    }
+                }
+
+                // 将超标团的点重置为 -1 噪声
+                for (size_t i = 0; i < labels.size(); ++i) {
+                    int l = labels[i];
+                    if (l >= 0 && is_invalid[l]) {
+                        labels[i] = -1;
+                    }
+                }
+            }
         }
 
         // 获取最大类标签
@@ -106,18 +175,14 @@ private:
         // 5. 构建并发布带有聚类标签的自定义消息
         auto out_msg = pc_msgs::msg::ClusteredPointCloud();
         out_msg.header = msg->header;
-
-        // 直接复用输入消息中已展平的点数据，避免重新内存分配拷贝
         out_msg.points = msg->points;
-
-        // 分配标签并设值
         out_msg.labels.assign(labels.begin(), labels.end());
         out_msg.max_label = max_label;
 
         publisher_->publish(out_msg);
 
         int num_clusters = max_label >= 0 ? max_label + 1 : 0;
-        RCLCPP_INFO(this->get_logger(), "[*] Clustering finished: Input points %zu, Recover %d clusters.", num_points, num_clusters);
+        RCLCPP_INFO(this->get_logger(), "[*] Clustering finished: Input points %zu, Recover %d valid clusters.", num_points, num_clusters);
     }
 
     double r_ref_;
@@ -126,6 +191,9 @@ private:
     double phi_weight_;
     double cluster_eps_;
     int cluster_min_samples_;
+    int cluster_max_samples_;
+    double max_cluster_extent_;
+    bool enable_range_balancing_;
 
     rclcpp::Subscription<pc_msgs::msg::O3DPointCloud>::SharedPtr subscription_;
     rclcpp::Publisher<pc_msgs::msg::ClusteredPointCloud>::SharedPtr publisher_;

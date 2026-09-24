@@ -9,12 +9,20 @@ parallel_dbscan_node:
     r_ref: 2000.0
 
     # 各向异性权重
-    # r_weight: 增大径向权重 (设为 3.0~5.0)，惩罚沿雷达/激光射线的过度延伸，消除从中心向外放射状长条
-    r_weight: 1.0
-    theta_weight: 1.0
-    phi_weight: 1.0
+    r_weight: 2.5
+    theta_weight: 0.5
+    phi_weight: 0.6
+
+    # 距离密度平衡缩放策略 (解决近处黏连长方体、远处变成黑点问题)
+    enable_range_balancing: true
 
     # DBSCAN 算法参数
-    # cluster_eps: 邻域物理搜索半径 (单位: 米)。调小 (如 6.0~8.0m) 防止沿射线产生 density-chaining 泛滥串扰
-    cluster_eps: 8.0
-    cluster_min_samples: 5
+    cluster_eps: 20.0
+    cluster_min_samples: 15
+
+    # 聚类最大限制参数 (解决长方体白模铺满地面问题)
+    # cluster_max_samples: 限制单个类别的最大点数上限，超过该点数的超级巨团直接设为噪声(-1)过滤
+    cluster_max_samples: 3000
+
+    # max_cluster_extent: 限制单个类别的最大物理外接盒尺寸上限 (单位: 米)
+    max_cluster_extent: 500.0
