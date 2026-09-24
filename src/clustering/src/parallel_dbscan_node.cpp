@@ -21,16 +21,18 @@ public:
         this->declare_parameter<std::string>("subscribe_topic", "/gs/non_ground_pointcloud");
         this->declare_parameter<std::string>("publish_topic", "/clustering/clustered_pointcloud");
 
-        this->declare_parameter<double>("r_weight", 3.0);
-        this->declare_parameter<double>("theta_weight", 650.0);
-        this->declare_parameter<double>("phi_weight", 600.0);
+        this->declare_parameter<double>("r_ref", 2000.0);
+        this->declare_parameter<double>("r_weight", 1.0);
+        this->declare_parameter<double>("theta_weight", 1.0);
+        this->declare_parameter<double>("phi_weight", 1.0);
 
-        this->declare_parameter<double>("cluster_eps", 18.0);
+        this->declare_parameter<double>("cluster_eps", 20.0);
         this->declare_parameter<int>("cluster_min_samples", 5);
 
         auto sub_topic = this->get_parameter("subscribe_topic").as_string();
         auto pub_topic = this->get_parameter("publish_topic").as_string();
 
+        r_ref_ = this->get_parameter("r_ref").as_double();
         r_weight_ = this->get_parameter("r_weight").as_double();
         theta_weight_ = this->get_parameter("theta_weight").as_double();
         phi_weight_ = this->get_parameter("phi_weight").as_double();
@@ -57,8 +59,8 @@ private:
 
         size_t num_points = msg->points.size() / 3;
 
-        // 2 & 3. 特征工程：将笛卡尔坐标转换为加权极坐标空间
-        // 我们创建一个 "虚拟点云"，将其 X, Y, Z 替换为加权后的 r, theta, phi 特征
+        // 2 & 3. 特征工程：将笛卡尔坐标转换为加权极坐标空间（利用弧长公式进行物理量纲统一归一化）
+        // 我们创建一个 "虚拟点云"，将其 X, Y, Z 替换为归一化且加权后的 r, theta, phi 特征
         auto feature_pcd = std::make_shared<open3d::geometry::PointCloud>();
         feature_pcd->points_.reserve(num_points);
 
@@ -72,11 +74,16 @@ private:
             double r_safe = std::max(r, 1e-6);
             double phi = std::asin(z / r_safe);
 
+            // 动态局部弧长归一化：将每个点的角度乘以该点的实际距离 r_safe，使切向物理距离 1:1 对齐真实物理米数
+            double r_meter = r;
+            double theta_meter = r_safe * theta;
+            double phi_meter = r_safe * phi;
+
             // 存入虚拟点云
             feature_pcd->points_.emplace_back(
-                r * r_weight_,
-                theta * theta_weight_,
-                phi * phi_weight_
+                r_meter * r_weight_,
+                theta_meter * theta_weight_,
+                phi_meter * phi_weight_
             );
         }
 
@@ -113,6 +120,7 @@ private:
         RCLCPP_INFO(this->get_logger(), "[*] Clustering finished: Input points %zu, Recover %d clusters.", num_points, num_clusters);
     }
 
+    double r_ref_;
     double r_weight_;
     double theta_weight_;
     double phi_weight_;

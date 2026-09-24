@@ -4,11 +4,17 @@ parallel_dbscan_node:
     subscribe_topic: "/gs/non_ground_pointcloud"
     publish_topic: "/clustering/clustered_pointcloud"
 
-    # 极坐标空间权重
-    r_weight: 3.0
-    theta_weight: 650.0
-    phi_weight: 600.0
+    # 极坐标特征物理量纲对齐配置
+    # r_ref: (备用) 静态参考距离
+    r_ref: 2000.0
+
+    # 各向异性权重
+    # r_weight: 增大径向权重 (设为 3.0~5.0)，惩罚沿雷达/激光射线的过度延伸，消除从中心向外放射状长条
+    r_weight: 1.0
+    theta_weight: 1.0
+    phi_weight: 1.0
 
     # DBSCAN 算法参数
-    cluster_eps: 18.0
+    # cluster_eps: 邻域物理搜索半径 (单位: 米)。调小 (如 6.0~8.0m) 防止沿射线产生 density-chaining 泛滥串扰
+    cluster_eps: 8.0
     cluster_min_samples: 5
