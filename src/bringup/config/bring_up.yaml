@@ -1,0 +1,11 @@
+bringup_node:
+  ros__parameters:
+    # 5个子节点的启动文件名称
+    visualization_launch: "v_vis.launch.py"
+    reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
+    clustering_launch: "c_pdbscan.launch.py"
+    ground_segmentation_launch: "gs_gmz.launch.py"
+    io_handlers_launch: "io_simPlaneDataFlow.launch.py"
+
+    # 依次拉起节点的时间间隔 (单位: 秒)
+    launch_interval_sec: 3.0

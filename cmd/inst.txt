@@ -5,6 +5,9 @@ colcon build --packages-select [...] --symlink-install
 # source
 source install/setup.zsh
 
+# bring up all node once time
+ros2 launch bringup bring_up.launch.py
+
 # io
 ros2 launch io_handlers io_simLidarDataFlow.launch.py
 [option] 带有模拟发送飞机飞行位置状态的io节点
