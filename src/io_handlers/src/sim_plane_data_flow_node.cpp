@@ -338,9 +338,8 @@ private:
         state_publisher_->publish(state_msg);
 
         RCLCPP_INFO(this->get_logger(),
-                    "[*] Frame[%zu] '%s' published | Points: %zu | GPS: (%.9f, %.9f, %.4f) Course: %.6f",
-                    current_idx_, frame.file_name.c_str(), frame.num_points,
-                    frame.latitude, frame.longitude, frame.altitude, frame.course);
+                    "[STAGE-DONE] io_handlers: Frame %zu published | File: '%s' | Points: %zu | Time: 0.00 ms",
+                    current_idx_, frame.file_name.c_str(), frame.num_points);
 
         ++current_idx_;
     }

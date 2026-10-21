@@ -481,11 +481,11 @@ private:
         auto elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - start_time).count();
 
+        static size_t r_frame_seq = 0;
+        ++r_frame_seq;
         RCLCPP_INFO(this->get_logger(),
-            "[*] PT Reconstruction done! Terrain: %s | Objects: %d | Time: %.2f ms",
-            ground_reconstructed ? "Yes" : "Failed",
-            ground_reconstructed ? valid_hull_count - 1 : valid_hull_count,
-            elapsed_ms);
+            "[STAGE-DONE] reconstruction: Frame %zu processed | Vertices: %zu, Triangles: %zu | Time: %.2f ms",
+            r_frame_seq, out_msg.vertices.size() / 3, out_msg.triangles.size() / 3, elapsed_ms);
     }
 
     // ── 高压塔插入：查询 Service → GPS→ENU → 插入模型 ────────────────────

@@ -220,8 +220,14 @@ private:
         auto end_time = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
-        RCLCPP_INFO(this->get_logger(), "[*] GMZ Segmented! Ground: %zu, Non-Ground: %zu, Waiting for reconstruction: %zu. Time: %.2f ms",
-                    pcd->points_.size()-non_ground_pcd->points_.size(), non_ground_pcd->points_.size(), sparse_ground_pcd->points_.size(), elapsed_ms);
+        static size_t gs_frame_seq = 0;
+        ++gs_frame_seq;
+        RCLCPP_INFO(this->get_logger(),
+            "[STAGE-DONE] ground_segmentation: Frame %zu processed | Ground: %zu, Non-Ground: %zu | Time: %.2f ms",
+            gs_frame_seq,
+            pcd->points_.size() - non_ground_pcd->points_.size(),
+            non_ground_pcd->points_.size(),
+            elapsed_ms);
 
 
         // 本地文件保存 (.ply)

@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,9 +104,10 @@ public:
 
         // 系统运行效率 / FPS 监控参数
         this->declare_parameter<bool>("enable_efficiency_monitor", true);
-        this->declare_parameter<std::string>("efficiency_monitor_topic", "/flow/aligned_mesh");
+        this->declare_parameter<std::string>("efficiency_monitor_topic", "");
+        this->declare_parameter<std::string>("monitor_target_node", "visualization");
         this->declare_parameter<double>("efficiency_report_interval_sec", 3.0);
-        this->declare_parameter<std::string>("efficiency_log_signal_keyword", "[RX] Accepted mesh");
+        this->declare_parameter<std::string>("efficiency_log_signal_keyword", "[STAGE-DONE]");
 
         double launch_interval = this->get_parameter("launch_interval_sec").as_double();
         shutdown_in_reverse_ = this->get_parameter("shutdown_in_reverse").as_bool();
@@ -116,6 +119,7 @@ public:
 
         enable_efficiency_monitor_ = this->get_parameter("enable_efficiency_monitor").as_bool();
         efficiency_monitor_topic_ = this->get_parameter("efficiency_monitor_topic").as_string();
+        monitor_target_node_ = this->get_parameter("monitor_target_node").as_string();
         double report_interval = this->get_parameter("efficiency_report_interval_sec").as_double();
         efficiency_signal_keyword_ = this->get_parameter("efficiency_log_signal_keyword").as_string();
 
@@ -226,7 +230,7 @@ public:
                         node_cfg.launch_file.c_str());
 
             int pfd[2] = {-1, -1};
-            bool use_pipe = node_cfg.show_output && (node_cfg.log_level != "NONE");
+            bool use_pipe = enable_efficiency_monitor_ || (node_cfg.show_output && (node_cfg.log_level != "NONE"));
 
             if (use_pipe) {
                 if (pipe(pfd) < 0) {
@@ -272,7 +276,8 @@ public:
                     close(pfd[1]);
                     node_cfg.pipe_fd = pfd[0];
                     reader_threads_.emplace_back(&BringupNode::read_child_output, this,
-                                                 node_cfg.package_name, node_cfg.log_level, pfd[0]);
+                                                 node_cfg.package_name, node_cfg.log_level,
+                                                 node_cfg.show_output, pfd[0]);
                 }
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[!] Failed to fork process for %s", node_cfg.package_name.c_str());
@@ -293,16 +298,22 @@ public:
         // =====================================================================
         // 7. 初始化系统总体运行效率 / 帧率监控
         // =====================================================================
-        if (enable_efficiency_monitor_ && !efficiency_monitor_topic_.empty()) {
-            mesh_sub_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
-                efficiency_monitor_topic_,
-                rclcpp::QoS(rclcpp::KeepLast(1)),
-                std::bind(&BringupNode::on_mesh_frame_received, this, std::placeholders::_1)
-            );
+        if (enable_efficiency_monitor_) {
             window_start_time_ = std::chrono::steady_clock::now();
-            RCLCPP_INFO(this->get_logger(),
-                "[*] Efficiency Monitor activated! Tracking topic: \033[1;32m%s\033[0m (report interval: %.1f s)",
-                efficiency_monitor_topic_.c_str(), report_interval);
+            if (!efficiency_monitor_topic_.empty()) {
+                mesh_sub_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
+                    efficiency_monitor_topic_,
+                    rclcpp::QoS(rclcpp::KeepLast(1)),
+                    std::bind(&BringupNode::on_mesh_frame_received, this, std::placeholders::_1)
+                );
+                RCLCPP_INFO(this->get_logger(),
+                    "[*] Efficiency Monitor activated via ROS2 Topic: \033[1;32m%s\033[0m (report interval: %.1f s)",
+                    efficiency_monitor_topic_.c_str(), report_interval);
+            } else {
+                RCLCPP_INFO(this->get_logger(),
+                    "[*] Efficiency Monitor activated via STDOUT Signal listening (Zero-DDS mode, target node: '\033[1;32m%s\033[0m', keyword: '%s', report interval: %.1f s)",
+                    monitor_target_node_.c_str(), efficiency_signal_keyword_.c_str(), report_interval);
+            }
 
             efficiency_timer_ = this->create_wall_timer(
                 std::chrono::duration<double>(report_interval),
@@ -438,7 +449,15 @@ private:
     }
 
     // 子进程输出行读取与过滤线程
-    void read_child_output(std::string pkg_name, std::string log_level, int fd) {
+    struct StageStat {
+        size_t count{0};
+        double sum_time_ms{0.0};
+        double max_time_ms{0.0};
+        double last_time_ms{0.0};
+    };
+
+    // 子进程输出行读取与过滤线程
+    void read_child_output(std::string pkg_name, std::string log_level, bool show_output, int fd) {
         FILE * fp = fdopen(fd, "r");
         if (!fp) {
             close(fd);
@@ -459,16 +478,65 @@ private:
 
             std::string line_str(line_buf, n_read);
 
-            // 检查是否包含接收帧信号（如 [RX] Accepted mesh）
-            if (!efficiency_signal_keyword_.empty() &&
-                line_str.find(efficiency_signal_keyword_) != std::string::npos) {
-                std::lock_guard<std::mutex> lock(stdout_mutex_);
-                std::cout << "\033[1;35m[SYSTEM SIGNAL from " << pkg_name << "]\033[0m "
-                          << line_str << std::endl;
+            // 1. 检查各节点结构化确认信息 [STAGE-DONE]
+            if (line_str.find("[STAGE-DONE]") != std::string::npos) {
+                auto pos = line_str.find("[STAGE-DONE]");
+                std::string rest = line_str.substr(pos + 12);
+                size_t s_idx = rest.find_first_not_of(" \t");
+                if (s_idx != std::string::npos) rest = rest.substr(s_idx);
+
+                auto colon_pos = rest.find(':');
+                std::string stage_pkg = (colon_pos != std::string::npos) ? rest.substr(0, colon_pos) : pkg_name;
+
+                double stage_time = -1.0;
+                auto time_pos = line_str.find("Time:");
+                if (time_pos != std::string::npos) {
+                    sscanf(line_str.c_str() + time_pos, "Time: %lf", &stage_time);
+                }
+
+                {
+                    std::lock_guard<std::recursive_mutex> lock(fps_mutex_);
+                    if (stage_time >= 0.0) {
+                        auto & stat = stage_stats_[stage_pkg];
+                        stat.count++;
+                        stat.sum_time_ms += stage_time;
+                        stat.max_time_ms = std::max(stat.max_time_ms, stage_time);
+                        stat.last_time_ms = stage_time;
+                    }
+
+                    // 零 DDS 开销模式：若该阶段与配置的目标监控节点匹配，触发帧计数与帧率统计
+                    if (!mesh_sub_) {
+                        if (monitor_target_node_ == "all" ||
+                            monitor_target_node_ == stage_pkg ||
+                            (monitor_target_node_.empty() && stage_pkg == "visualization")) {
+                            record_signal_frame_locked();
+                        }
+                    }
+                }
             }
 
-            // 日志等级过滤
-            if (should_display_log(level, line_str)) {
+            // 2. 检查是否包含自定义接收帧信号（如历史的 [RX] Accepted mesh）
+            if (!efficiency_signal_keyword_.empty() &&
+                line_str.find(efficiency_signal_keyword_) != std::string::npos &&
+                line_str.find("[STAGE-DONE]") == std::string::npos) {
+
+                auto pos = line_str.find("Accepted mesh:");
+                if (pos != std::string::npos) {
+                    double r_fps = 0.0;
+                    if (sscanf(line_str.c_str() + pos, "Accepted mesh: %lf", &r_fps) >= 1) {
+                        std::lock_guard<std::recursive_mutex> lock(fps_mutex_);
+                        reported_node_fps_ = r_fps;
+                        has_reported_node_fps_ = true;
+                    }
+                }
+
+                if (!mesh_sub_ && (monitor_target_node_ == "visualization" || monitor_target_node_ == pkg_name)) {
+                    record_signal_frame();
+                }
+            }
+
+            // 3. 日志终端输出控制与过滤
+            if (show_output && should_display_log(level, line_str)) {
                 std::lock_guard<std::mutex> lock(stdout_mutex_);
                 if (enable_color_prefix_) {
                     std::cout << get_pkg_color(pkg_name) << "[" << pkg_name << "]\033[0m "
@@ -485,10 +553,31 @@ private:
         fclose(fp);
     }
 
+    // 必须在持有 fps_mutex_ 锁时调用的轻量帧计数逻辑
+    void record_signal_frame_locked() {
+        auto now = std::chrono::steady_clock::now();
+        total_frames_++;
+        window_frames_++;
+
+        if (last_frame_time_.time_since_epoch().count() > 0) {
+            double dt = std::chrono::duration<double>(now - last_frame_time_).count();
+            if (dt > 0.0001) {
+                instant_fps_ = 1.0 / dt;
+            }
+        }
+        last_frame_time_ = now;
+    }
+
+    // 纯标准输出信号触发的轻量帧计数（零 DDS 开销模式，供未持锁处调用）
+    void record_signal_frame() {
+        std::lock_guard<std::recursive_mutex> lock(fps_mutex_);
+        record_signal_frame_locked();
+    }
+
     // 接收到末端 mesh 回调：计算总体处理帧率与端到端延迟
     void on_mesh_frame_received(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
         auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(fps_mutex_);
+        std::lock_guard<std::recursive_mutex> lock(fps_mutex_);
         total_frames_++;
         window_frames_++;
 
@@ -514,41 +603,140 @@ private:
         last_frame_time_ = now;
     }
 
-    // 定期汇报系统运行效率
+    // 定期汇报系统运行效率与阶段瓶颈分析
     void report_efficiency() {
-        std::lock_guard<std::mutex> lock(fps_mutex_);
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - window_start_time_).count();
-        if (elapsed < 0.5) return;
+        std::string report_line = "";
+        std::string breakdown_table = "";
+        bool has_report = false;
+        bool is_warn = false;
 
-        if (window_frames_ > 0) {
-            double avg_fps = static_cast<double>(window_frames_) / elapsed;
-            if (latency_sample_count_ > 0) {
-                double avg_lat = latency_sum_ms_ / latency_sample_count_;
-                RCLCPP_INFO(this->get_logger(),
-                    "\033[1;32m[SYSTEM EFFICIENCY]\033[0m Window: %.1fs | Throughput: \033[1;32m%.2f FPS\033[0m (Instant: %.2f FPS) | "
-                    "E2E Latency: %.1f ms [min: %.1f, max: %.1f] | Frames: %zu (Total: %zu)",
-                    elapsed, avg_fps, instant_fps_, avg_lat, min_latency_ms_, max_latency_ms_,
-                    window_frames_, total_frames_);
+        {
+            std::lock_guard<std::recursive_mutex> lock(fps_mutex_);
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - window_start_time_).count();
+            if (elapsed < 0.5) return;
+
+            std::string source_tag = mesh_sub_ ? ("[Topic: " + efficiency_monitor_topic_ + "]")
+                                               : ("[Signal: " + monitor_target_node_ + "]");
+
+            if (window_frames_ > 0 || has_reported_node_fps_) {
+                double avg_fps = (elapsed > 0.1 && window_frames_ > 0)
+                                     ? (static_cast<double>(window_frames_) / elapsed)
+                                     : (has_reported_node_fps_ ? reported_node_fps_ : 0.0);
+
+                char buf[512];
+                if (latency_sample_count_ > 0) {
+                    double avg_lat = latency_sum_ms_ / latency_sample_count_;
+                    snprintf(buf, sizeof(buf),
+                        "\033[1;32m[SYSTEM EFFICIENCY]\033[0m %s Window: %.1fs | Throughput: \033[1;32m%.2f FPS\033[0m (Instant: %.2f FPS) | "
+                        "E2E Latency: %.1f ms [min: %.1f, max: %.1f] | Frames: %zu (Total: %zu)",
+                        source_tag.c_str(), elapsed, avg_fps, instant_fps_, avg_lat, min_latency_ms_, max_latency_ms_,
+                        window_frames_, total_frames_);
+                } else if (has_reported_node_fps_) {
+                    snprintf(buf, sizeof(buf),
+                        "\033[1;32m[SYSTEM EFFICIENCY]\033[0m %s Visualization Reported: \033[1;32m%.2f FPS\033[0m | Signal Window: %.1fs | "
+                        "Frames: %zu (Total: %zu)",
+                        source_tag.c_str(), reported_node_fps_, elapsed, window_frames_, total_frames_);
+                } else {
+                    snprintf(buf, sizeof(buf),
+                        "\033[1;32m[SYSTEM EFFICIENCY]\033[0m %s Window: %.1fs | Throughput: \033[1;32m%.2f FPS\033[0m (Instant: %.2f FPS) | "
+                        "Frames: %zu (Total: %zu)",
+                        source_tag.c_str(), elapsed, avg_fps, instant_fps_, window_frames_, total_frames_);
+                }
+                report_line = buf;
+                has_report = true;
+            } else if (total_frames_ > 0) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "\033[1;33m[SYSTEM EFFICIENCY]\033[0m %s No new frames received in the last %.1fs. Total: %zu",
+                    source_tag.c_str(), elapsed, total_frames_);
+                report_line = buf;
+                has_report = true;
+                is_warn = true;
             } else {
-                RCLCPP_INFO(this->get_logger(),
-                    "\033[1;32m[SYSTEM EFFICIENCY]\033[0m Window: %.1fs | Throughput: \033[1;32m%.2f FPS\033[0m (Instant: %.2f FPS) | "
-                    "Frames: %zu (Total: %zu)",
-                    elapsed, avg_fps, instant_fps_, window_frames_, total_frames_);
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "\033[1;36m[SYSTEM EFFICIENCY]\033[0m %s Waiting for frames from target node '%s' (Pipeline running)...",
+                    source_tag.c_str(), monitor_target_node_.c_str());
+                report_line = buf;
+                has_report = true;
             }
-        } else if (total_frames_ > 0) {
-            RCLCPP_WARN(this->get_logger(),
-                "\033[1;33m[SYSTEM EFFICIENCY]\033[0m No new frames received in the last %.1fs. Total: %zu",
-                elapsed, total_frames_);
+
+            // 输出流水线各阶段耗时对比与瓶颈分析
+            if (!stage_stats_.empty()) {
+                std::string bottleneck_pkg = "";
+                double max_avg = 0.0;
+                for (const auto & kv : stage_stats_) {
+                    if (kv.second.count > 0) {
+                        double avg = kv.second.sum_time_ms / kv.second.count;
+                        if (avg > max_avg) {
+                            max_avg = avg;
+                            bottleneck_pkg = kv.first;
+                        }
+                    }
+                }
+
+                std::stringstream ss;
+                ss << "\033[1;36m┌──────────────────────── Pipeline Stage Latency Breakdown ────────────────────────┐\033[0m\n";
+                std::vector<std::string> ordered_stages = {
+                    "io_handlers", "ground_segmentation", "clustering",
+                    "reconstruction", "flow_alignment", "visualization"
+                };
+
+                for (const auto & pkg : ordered_stages) {
+                    bool is_active = false;
+                    for (const auto & ac : active_nodes_) {
+                        if (ac.package_name == pkg) { is_active = true; break; }
+                    }
+                    if (!is_active) continue;
+
+                    auto it = stage_stats_.find(pkg);
+                    if (it != stage_stats_.end() && it->second.count > 0) {
+                        double avg = it->second.sum_time_ms / it->second.count;
+                        char buf[256];
+                        snprintf(buf, sizeof(buf),
+                                 "│  %-20s | Frames: %4zu | Avg: %6.1f ms | Max: %6.1f ms | Last: %6.1f ms",
+                                 pkg.c_str(), it->second.count, avg, it->second.max_time_ms, it->second.last_time_ms);
+                        ss << buf;
+                        if (pkg == bottleneck_pkg && max_avg > 0.0) {
+                            ss << " \033[1;31m<-- [BOTTLENECK]\033[0m │\n";
+                        } else {
+                            ss << "                 │\n";
+                        }
+                    } else {
+                        char buf[256];
+                        snprintf(buf, sizeof(buf),
+                                 "│  %-20s | Frames:    0 | In progress / awaiting input...             │\n",
+                                 pkg.c_str());
+                        ss << buf;
+                    }
+                }
+                ss << "\033[1;36m└──────────────────────────────────────────────────────────────────────────────────┘\033[0m\n";
+                breakdown_table = ss.str();
+            }
+
+            // 重置窗口计数
+            window_frames_ = 0;
+            window_start_time_ = now;
+            latency_sum_ms_ = 0.0;
+            latency_sample_count_ = 0;
+            min_latency_ms_ = 1e9;
+            max_latency_ms_ = 0.0;
         }
 
-        // 重置窗口计数
-        window_frames_ = 0;
-        window_start_time_ = now;
-        latency_sum_ms_ = 0.0;
-        latency_sample_count_ = 0;
-        min_latency_ms_ = 1e9;
-        max_latency_ms_ = 0.0;
+        // 在锁外输出日志，避免与 stdout_mutex_ 发生竞争
+        if (has_report) {
+            if (is_warn) {
+                RCLCPP_WARN(this->get_logger(), "%s", report_line.c_str());
+            } else {
+                RCLCPP_INFO(this->get_logger(), "%s", report_line.c_str());
+            }
+        }
+        if (!breakdown_table.empty()) {
+            std::lock_guard<std::mutex> lock(stdout_mutex_);
+            std::cout << breakdown_table;
+            std::cout.flush();
+        }
     }
 
     // 监控子进程退出状态
@@ -589,10 +777,11 @@ private:
 
     // 系统运行效率统计
     bool enable_efficiency_monitor_ = true;
-    std::string efficiency_monitor_topic_ = "/flow/aligned_mesh";
-    std::string efficiency_signal_keyword_ = "[RX] Accepted mesh";
+    std::string efficiency_monitor_topic_ = "";
+    std::string monitor_target_node_ = "visualization";
+    std::string efficiency_signal_keyword_ = "[STAGE-DONE]";
 
-    std::mutex fps_mutex_;
+    std::recursive_mutex fps_mutex_;
     size_t total_frames_ = 0;
     size_t window_frames_ = 0;
     double instant_fps_ = 0.0;
@@ -602,6 +791,10 @@ private:
     size_t latency_sample_count_ = 0;
     double min_latency_ms_ = 1e9;
     double max_latency_ms_ = 0.0;
+    bool has_reported_node_fps_ = false;
+    double reported_node_fps_ = 0.0;
+
+    std::map<std::string, StageStat> stage_stats_;
 };
 
 int main(int argc, char * argv[]) {

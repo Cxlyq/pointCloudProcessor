@@ -150,7 +150,9 @@ private:
         }
 
         publisher_->publish(msg);
-        RCLCPP_INFO(this->get_logger(), "[*] %s has been published | Point: %zu", frame.file_name.c_str(), frame.num_points);
+        RCLCPP_INFO(this->get_logger(),
+            "[STAGE-DONE] io_handlers: Frame %zu published | File: '%s' | Points: %zu | Time: 0.00 ms",
+            current_idx_, frame.file_name.c_str(), frame.num_points);
 
         current_idx_++;
         if (is_loop_)

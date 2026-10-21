@@ -13,11 +13,12 @@ bringup_node:
     global_log_level: "INFO" # 可设为 "WARN" 仅查看告警与异常
     enable_color_prefix: true
 
-    # 开发板 2 吞吐效率统计（监听开发板 2 的输入/最终渲染网格 /flow/aligned_mesh）
+    # 开发板 2 吞吐效率统计（零 DDS 开销模式：指定监控最终渲染节点 visualization）
     enable_efficiency_monitor: true
-    efficiency_monitor_topic: "/flow/aligned_mesh"
+    efficiency_monitor_topic: ""
+    monitor_target_node: "visualization"
     efficiency_report_interval_sec: 3.0
-    efficiency_log_signal_keyword: "[RX] Accepted mesh"
+    efficiency_log_signal_keyword: "[STAGE-DONE]"
 
     # ---- 异板运行节点 (开发板 1 运行，本板禁用) ----
     io_handlers_enable: false

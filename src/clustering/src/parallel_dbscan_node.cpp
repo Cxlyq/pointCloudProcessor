@@ -58,6 +58,7 @@ public:
 
 private:
     void pointcloud_callback(const pc_msgs::msg::O3DPointCloud::SharedPtr msg) const {
+        auto start_time = std::chrono::high_resolution_clock::now();
         // 1. 检查输入
         if (msg->points.empty()) {
             RCLCPP_WARN(this->get_logger(), "[?] Received no points message. Scaped clustering.");
@@ -182,7 +183,13 @@ private:
         publisher_->publish(out_msg);
 
         int num_clusters = max_label >= 0 ? max_label + 1 : 0;
-        RCLCPP_INFO(this->get_logger(), "[*] Clustering finished: Input points %zu, Recover %d valid clusters.", num_points, num_clusters);
+        static size_t c_frame_seq = 0;
+        ++c_frame_seq;
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        RCLCPP_INFO(this->get_logger(),
+            "[STAGE-DONE] clustering: Frame %zu processed | Input: %zu, Clusters: %d | Time: %.2f ms",
+            c_frame_seq, num_points, num_clusters, elapsed_ms);
     }
 
     double r_ref_;

@@ -1575,6 +1575,14 @@ private:
             num_vertices,
             num_triangles,
             superseded_previous_mesh);
+
+        static size_t rx_frame_seq = 0;
+        ++rx_frame_seq;
+        auto callback_end_at = std::chrono::steady_clock::now();
+        double proc_ms = std::chrono::duration<double, std::milli>(callback_end_at - mesh_received_at).count();
+        RCLCPP_INFO(this->get_logger(),
+            "[STAGE-DONE] visualization: Frame %zu received | Vertices: %zu, Triangles: %zu | Time: %.2f ms",
+            rx_frame_seq, num_vertices, num_triangles, proc_ms);
     }
 
     std::vector<CamConfig> visualizers_;

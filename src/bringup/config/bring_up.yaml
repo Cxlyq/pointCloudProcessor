@@ -28,14 +28,18 @@ bringup_node:
     # =========================================================================
     # 系统运行总体效率 / 帧率监控配置：
     # 1. enable_efficiency_monitor: 是否启用端到端处理效率监控
-    # 2. efficiency_monitor_topic:  用于统计完成帧率的主题 (单机或开发板2使用 /flow/aligned_mesh，开发板1使用 /reconstruction/white_mesh)
-    # 3. efficiency_report_interval_sec: 效率与 FPS 输出周期 (单位: 秒)
-    # 4. efficiency_log_signal_keyword: 识别节点标准输出中的接收帧信号关键字
+    # 2. efficiency_monitor_topic:  用于统计完成帧率的主题。若留空 ""，则自动进入零 DDS 开销的
+    #                               标准输出信号监听模式 (推荐，无网络/反序列化负担)
+    # 3. monitor_target_node:       指定监听效率的目标节点名称 (如 "visualization"、"reconstruction"、
+    #                               "flow_alignment"、"clustering"、"ground_segmentation"、"io_handlers" 或 "all")
+    # 4. efficiency_report_interval_sec: 效率与 FPS 输出周期 (单位: 秒)
+    # 5. efficiency_log_signal_keyword: 识别节点标准输出中的接收帧信号关键字 (默认 "[STAGE-DONE]")
     # =========================================================================
     enable_efficiency_monitor: true
-    efficiency_monitor_topic: "/flow/aligned_mesh"
+    efficiency_monitor_topic: ""
+    monitor_target_node: "visualization"
     efficiency_report_interval_sec: 3.0
-    efficiency_log_signal_keyword: "[RX] Accepted mesh"
+    efficiency_log_signal_keyword: "[STAGE-DONE]"
 
     # =========================================================================
     # 各功能节点参数配置：

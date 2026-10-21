@@ -390,7 +390,9 @@ private:
 
         double total_ms = std::chrono::duration<double, std::milli>(
                               std::chrono::high_resolution_clock::now() - t_start).count();
-        RCLCPP_INFO(this->get_logger(), "  [total] frame=%zu %.1f ms", frame_seq_, total_ms);
+        RCLCPP_INFO(this->get_logger(),
+            "[STAGE-DONE] flow_alignment: Frame %zu processed | Aligned vertices: %zu | Time: %.2f ms",
+            frame_seq_, aligned ? aligned->vertices_.size() : 0, total_ms);
         ++frame_seq_;
     }
 
