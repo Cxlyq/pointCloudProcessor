@@ -1,0 +1,24 @@
+# flow_alignment_node 参数（与 flow_test/flow_config.yaml 固化值一致）
+flow_alignment_node:
+  ros__parameters:
+    # ---- 话题 ----
+    sub_mesh_topic: /reconstruction/white_mesh       # 输入：重建节点输出的每帧白膜 mesh
+    pub_aligned_mesh_topic: /flow/aligned_mesh       # 输出：对齐后白膜 mesh（世界系）
+    pub_map_pc_topic: /flow/aligned_pointcloud       # 输出：滑动窗口 map 采样点云（空串=关闭）
+    pub_stats_topic: /flow/registration_stats        # 输出：配准统计 Float64MultiArray
+
+    # ---- 滑动窗口 / 配准（与 flow_test 固化值一致）----
+    window_size: 4
+    icp_voxel_downsample: 3.0
+    alpha: 0.7
+    icp_max_iter_per_level: 40
+    icp_normal_angle_deg: 60.0
+    use_gps_init: false          # white_mesh 无 GPS 字段；真机如需 GPS 初值另行注入
+    align_scale: 1.0
+    normal_radius: 20.0          # mesh 无法线时的兜底法线估计参数
+    normal_max_nn: 15
+
+    # ---- 保存（CloudCompare 直接查看）----
+    data_saved_dir: ""           # 例如 /home/trf/.../flow_alignment_out
+    enable_aligned_saving: false # true 时保存 aligned_<stamp>.ply（对齐后白膜）
+    enable_map_saving: false     # true 时保存 map_<stamp>.ply（窗口合并点云）

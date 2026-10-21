@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>flow_alignment</name>
+  <version>1.0.0</version>
+  <description>
+    白膜帧间配准节点：订阅 /reconstruction/white_mesh（pc_msgs/msg/O3DMesh），
+    用 Trimmed Point-to-Plane ICP（多尺度 8r->4r->2r，alpha 截断）把每帧白膜
+    配准到滑动窗口世界系 map，发布对齐后的白膜 mesh / 窗口点云 / 配准统计。
+    算法与 flow_test/demo_flow.cpp 完全一致，仅封装为 ROS 2 节点。
+  </description>
+  <maintainer email="trf@example.com">trf</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>pc_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
