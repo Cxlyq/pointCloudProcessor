@@ -24,6 +24,7 @@ public:
     BringupNode() : Node("bringup_node") {
         // 1. 声明参数及其默认启动文件名
         this->declare_parameter<std::string>("visualization_launch", "v_dis_bidirectional.launch.py");
+	this->declare_parameter<std::string>("flow_alignment_launch", "flow_alignment.launch.py");
         this->declare_parameter<std::string>("reconstruction_launch", "r_g_poisson_ng_obb.launch.py");
         this->declare_parameter<std::string>("clustering_launch", "c_pdbscan.launch.py");
         this->declare_parameter<std::string>("ground_segmentation_launch", "gs_gmz.launch.py");
@@ -32,10 +33,11 @@ public:
 
         double launch_interval = this->get_parameter("launch_interval_sec").as_double();
 
-        // 严格按照要求的顺序定义 5 个子节点：
-        // 依次拉起: visualization -> reconstruction -> clustering -> ground_segmentation -> io_handlers
+        // 严格按照要求的顺序定义 6 个子节点：
+        // 依次拉起: visualization -> flow_alignment -> reconstruction -> clustering -> ground_segmentation -> io_handlers
         sub_nodes_ = {
             {"visualization",       "visualization_launch",       "v_dis_bidirectional.launch.py", "", -1},
+	        {"flow_alignment", 	    "flow_alignment_launch",      "flow_alignment.launch.py", 	"",	-1},
             {"reconstruction",      "reconstruction_launch",      "r_g_poisson_ng_obb.launch.py",  "", -1},
             {"clustering",          "clustering_launch",          "c_pdbscan.launch.py",           "", -1},
             {"ground_segmentation", "ground_segmentation_launch", "gs_gmz.launch.py",              "", -1},
@@ -51,7 +53,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "[*] Launch sequence: visualization -> reconstruction -> clustering -> ground_segmentation -> io_handlers");
         RCLCPP_INFO(this->get_logger(), "=========================================================");
 
-        // 2. 依次拉起 5 个子节点
+        // 2. 依次拉起 6 个子节点
         for (size_t i = 0; i < sub_nodes_.size(); ++i) {
             auto & node_cfg = sub_nodes_[i];
             RCLCPP_INFO(this->get_logger(), "[%zu/5] Spawning %s launch file: %s...",
@@ -79,7 +81,7 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(), "=========================================================");
-        RCLCPP_INFO(this->get_logger(), "[*] All 5 sub-nodes spawned successfully. Monitoring child processes...");
+        RCLCPP_INFO(this->get_logger(), "[*] All 6 sub-nodes spawned successfully. Monitoring child processes...");
         RCLCPP_INFO(this->get_logger(), "=========================================================");
 
         // 定时轮询监控子进程状态

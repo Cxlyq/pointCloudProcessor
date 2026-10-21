@@ -2,6 +2,7 @@ bringup_node:
   ros__parameters:
     # 5个子节点的启动文件名称
     visualization_launch: "v_vis.launch.py"
+    flow_alignment_launch: "flow_alignment.launch.py"
     reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
     clustering_launch: "c_pdbscan.launch.py"
     ground_segmentation_launch: "gs_gmz.launch.py"
