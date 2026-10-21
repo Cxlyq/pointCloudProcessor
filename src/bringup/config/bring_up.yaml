@@ -1,12 +1,94 @@
 bringup_node:
   ros__parameters:
-    # 5个子节点的启动文件名称
-    visualization_launch: "v_vis.launch.py"
-    flow_alignment_launch: "flow_alignment.launch.py"
-    reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
-    clustering_launch: "c_pdbscan.launch.py"
-    ground_segmentation_launch: "gs_gmz.launch.py"
-    io_handlers_launch: "io_simPlaneDataFlow.launch.py"
-
     # 依次拉起节点的时间间隔 (单位: 秒)
     launch_interval_sec: 3.0
+
+    # 优雅退出时是否以拉起顺序的反向顺序关闭 (true: 逆序关闭, false: 顺序关闭)
+    shutdown_in_reverse: false
+
+    # 可选：显式自定义拉起顺序列表（若非空则优先使用此顺序；留空时根据各节点 priority 数值升序拉起）
+    # custom_launch_order: []
+
+    # =========================================================================
+    # 终端输出控制与日志过滤配置：
+    # 1. global_show_output: 全局是否在 terminal 显示子节点输出 (false: 全部静音)
+    # 2. global_log_level:   全局日志过滤等级:
+    #      - "INFO"  (默认): 打印所有日志输出
+    #      - "WARN"         : 过滤普通 INFO / DEBUG，仅显示 WARNING 和 ERROR
+    #      - "ERROR"        : 过滤普通 INFO, DEBUG, WARN，仅显示 ERROR
+    #      - "NONE" / "OFF" : 完全静音终端输出
+    # 3. enable_color_prefix: 每行输出前是否自动带上颜色包名前缀，如 [visualization] ...
+    # 4. <node>_show_output: 控制单个节点在终端是否输出 (true / false)
+    # 5. <node>_log_level:   单独覆盖单个节点的过滤等级 ("INFO", "WARN", "ERROR", "NONE", 空为继承全局)
+    # =========================================================================
+    global_show_output: false
+    global_log_level: "INFO"
+    enable_color_prefix: true
+
+    # =========================================================================
+    # 系统运行总体效率 / 帧率监控配置：
+    # 1. enable_efficiency_monitor: 是否启用端到端处理效率监控
+    # 2. efficiency_monitor_topic:  用于统计完成帧率的主题 (单机或开发板2使用 /flow/aligned_mesh，开发板1使用 /reconstruction/white_mesh)
+    # 3. efficiency_report_interval_sec: 效率与 FPS 输出周期 (单位: 秒)
+    # 4. efficiency_log_signal_keyword: 识别节点标准输出中的接收帧信号关键字
+    # =========================================================================
+    enable_efficiency_monitor: true
+    efficiency_monitor_topic: "/flow/aligned_mesh"
+    efficiency_report_interval_sec: 3.0
+    efficiency_log_signal_keyword: "[RX] Accepted mesh"
+
+    # =========================================================================
+    # 各功能节点参数配置：
+    # 1. <node>_enable:      是否拉起该节点 (true: 拉起, false: 忽略/不启动)
+    # 2. <node>_priority:    启动优先级数值 (数值越小优先级越高，越早被拉起)
+    # 3. <node>_show_output: 是否在终端输出该节点内容 (true: 显示, false: 过滤静音)
+    # 4. <node>_log_level:   单独过滤等级 ("INFO" / "WARN" / "ERROR" / "NONE"，留空继承全局)
+    # 5. <node>_launch:      该节点调用的 launch 文件名
+    #
+    # 系统数据流传输顺序:
+    # io_handlers -> ground_segmentation -> clustering -> reconstruction -> flow_alignment -> visualization
+    # 推荐拉起顺序为数据流逆序（下游消费者先就绪，上游生产者后拉起，避免启动期数据丢失）:
+    # visualization -> flow_alignment -> reconstruction -> clustering -> ground_segmentation -> io_handlers
+    # =========================================================================
+
+    # 1. 最终可视化节点 (消费 /flow/aligned_mesh)
+    visualization_enable: true
+    visualization_priority: 1
+    visualization_show_output: true
+    visualization_log_level: ""
+    visualization_launch: "v_vis.launch.py"
+
+    # 2. 流式配准节点 (消费 /reconstruction/white_mesh, 生产 /flow/aligned_mesh)
+    flow_alignment_enable: true
+    flow_alignment_priority: 2
+    flow_alignment_show_output: true
+    flow_alignment_log_level: ""
+    flow_alignment_launch: "flow_alignment.launch.py"
+
+    # 3. 表面白模重建节点 (消费 /clustering/clustered_points, 生产 /reconstruction/white_mesh)
+    reconstruction_enable: true
+    reconstruction_priority: 3
+    reconstruction_show_output: true
+    reconstruction_log_level: ""
+    reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
+
+    # 4. 点云聚类节点 (消费 /ground_segmentation/nonground_points, 生产 /clustering/clustered_points)
+    clustering_enable: true
+    clustering_priority: 4
+    clustering_show_output: true
+    clustering_log_level: ""
+    clustering_launch: "c_pdbscan.launch.py"
+
+    # 5. 地面分割节点 (消费 /io_handlers/pointcloud, 生产 /ground_segmentation/nonground_points)
+    ground_segmentation_enable: true
+    ground_segmentation_priority: 5
+    ground_segmentation_show_output: true
+    ground_segmentation_log_level: ""
+    ground_segmentation_launch: "gs_gmz.launch.py"
+
+    # 6. 数据输入节点 (数据源)
+    io_handlers_enable: true
+    io_handlers_priority: 6
+    io_handlers_show_output: true
+    io_handlers_log_level: ""
+    io_handlers_launch: "io_simPlaneDataFlow.launch.py"

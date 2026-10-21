@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(pc_msgs REQUIRED)
 
 add_executable(bringup_node src/bringup_node.cpp)
 target_include_directories(bringup_node PUBLIC
@@ -18,6 +19,7 @@ target_compile_features(bringup_node PUBLIC c_std_99 cxx_std_17)
 ament_target_dependencies(
   bringup_node
   "rclcpp"
+  "pc_msgs"
 )
 
 install(TARGETS bringup_node

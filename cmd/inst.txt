@@ -5,8 +5,20 @@ colcon build --packages-select [...] --symlink-install
 # source
 source install/setup.zsh
 
-# bring up all node once time
+# bring up (一键拉起节点与监控)
+# 1) 单机模式（全节点 6 个同时按优先级拉起）:
 ros2 launch bringup bring_up.launch.py
+# 2) 过滤杂乱日志 (例如过滤普通 INFO，仅显示 WARNING/ERROR 异常):
+ros2 launch bringup bring_up.launch.py log_level:=WARN
+# 3) 完全静音子节点终端输出 (极致清爽):
+ros2 launch bringup bring_up.launch.py show_output:=false
+# 4) 双板分布式部署模式:
+#    开发板 1 (io_handlers -> ground_segmentation -> clustering -> reconstruction):
+ros2 launch bringup bring_up.launch.py board:=board1
+#    开发板 2 (flow_alignment -> visualization):
+ros2 launch bringup bring_up.launch.py board:=board2
+# 5) 指定自定义 YAML 参数配置文件:
+ros2 launch bringup bring_up.launch.py config_file:=/path/to/custom_config.yaml
 
 # io
 ros2 launch io_handlers io_simLidarDataFlow.launch.py

@@ -1,0 +1,55 @@
+# =========================================================================
+# 开发板 1 部署配置 (前序点云处理与白模重建)
+# 运行节点: io_handlers -> ground_segmentation -> clustering -> reconstruction
+# 启动顺序(下游先就绪): reconstruction -> clustering -> ground_segmentation -> io_handlers
+# =========================================================================
+bringup_node:
+  ros__parameters:
+    launch_interval_sec: 3.0
+    shutdown_in_reverse: false
+
+    # 终端输出与过滤设置
+    global_show_output: true
+    global_log_level: "INFO" # 可设为 "WARN" 仅查看告警与异常
+    enable_color_prefix: true
+
+    # 开发板 1 吞吐效率统计（监听开发板 1 的流水线终点 /reconstruction/white_mesh）
+    enable_efficiency_monitor: true
+    efficiency_monitor_topic: "/reconstruction/white_mesh"
+    efficiency_report_interval_sec: 3.0
+
+    # ---- 本板运行节点 (使能并设定启动优先级) ----
+    reconstruction_enable: true
+    reconstruction_priority: 1
+    reconstruction_show_output: true
+    reconstruction_log_level: ""
+    reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
+
+    clustering_enable: true
+    clustering_priority: 2
+    clustering_show_output: true
+    clustering_log_level: ""
+    clustering_launch: "c_pdbscan.launch.py"
+
+    ground_segmentation_enable: true
+    ground_segmentation_priority: 3
+    ground_segmentation_show_output: true
+    ground_segmentation_log_level: ""
+    ground_segmentation_launch: "gs_gmz.launch.py"
+
+    io_handlers_enable: true
+    io_handlers_priority: 4
+    io_handlers_show_output: true
+    io_handlers_log_level: ""
+    io_handlers_launch: "io_simPlaneDataFlow.launch.py"
+
+    # ---- 异板运行节点 (开发板 2 运行，本板禁用) ----
+    flow_alignment_enable: false
+    flow_alignment_priority: 5
+    flow_alignment_show_output: false
+    flow_alignment_launch: "flow_alignment.launch.py"
+
+    visualization_enable: false
+    visualization_priority: 6
+    visualization_show_output: false
+    visualization_launch: "v_vis.launch.py"

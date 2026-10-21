@@ -1,0 +1,54 @@
+# =========================================================================
+# 开发板 2 部署配置 (白模流式配准与最终三维渲染)
+# 运行节点: flow_alignment -> visualization
+# 启动顺序(下游先就绪): visualization -> flow_alignment
+# =========================================================================
+bringup_node:
+  ros__parameters:
+    launch_interval_sec: 3.0
+    shutdown_in_reverse: false
+
+    # 终端输出与过滤设置
+    global_show_output: true
+    global_log_level: "INFO" # 可设为 "WARN" 仅查看告警与异常
+    enable_color_prefix: true
+
+    # 开发板 2 吞吐效率统计（监听开发板 2 的输入/最终渲染网格 /flow/aligned_mesh）
+    enable_efficiency_monitor: true
+    efficiency_monitor_topic: "/flow/aligned_mesh"
+    efficiency_report_interval_sec: 3.0
+    efficiency_log_signal_keyword: "[RX] Accepted mesh"
+
+    # ---- 异板运行节点 (开发板 1 运行，本板禁用) ----
+    io_handlers_enable: false
+    io_handlers_priority: 1
+    io_handlers_show_output: false
+    io_handlers_launch: "io_simPlaneDataFlow.launch.py"
+
+    ground_segmentation_enable: false
+    ground_segmentation_priority: 2
+    ground_segmentation_show_output: false
+    ground_segmentation_launch: "gs_gmz.launch.py"
+
+    clustering_enable: false
+    clustering_priority: 3
+    clustering_show_output: false
+    clustering_launch: "c_pdbscan.launch.py"
+
+    reconstruction_enable: false
+    reconstruction_priority: 4
+    reconstruction_show_output: false
+    reconstruction_launch: "r_g_poisson_ng_obb_pt.launch.py"
+
+    # ---- 本板运行节点 (使能并设定启动优先级) ----
+    visualization_enable: true
+    visualization_priority: 1
+    visualization_show_output: true
+    visualization_log_level: ""
+    visualization_launch: "v_vis.launch.py"
+
+    flow_alignment_enable: true
+    flow_alignment_priority: 2
+    flow_alignment_show_output: true
+    flow_alignment_log_level: ""
+    flow_alignment_launch: "flow_alignment.launch.py"
