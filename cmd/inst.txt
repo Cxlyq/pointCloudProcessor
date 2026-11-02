@@ -1,6 +1,7 @@
 # compile
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 colcon build --packages-select [...] --symlink-install
+MAKEFLAGS="-j2" colcon build --packages-select [...] --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # source
 source install/setup.zsh
