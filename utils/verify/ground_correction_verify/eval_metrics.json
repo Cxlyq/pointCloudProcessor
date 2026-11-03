@@ -1,0 +1,27 @@
+{
+  "n_evaluated_points": 1819,
+  "max_positive_error_m": 36.086700439453125,
+  "max_positive_point": [
+    2071.7666015625,
+    1958.550048828125,
+    112.943603515625
+  ],
+  "min_negative_error_m": -9.062774658203125,
+  "min_negative_point": [
+    2587.20556640625,
+    -1237.1708984375,
+    155.05029296875
+  ],
+  "max_absolute_error_m": 36.086700439453125,
+  "min_absolute_error_m": 0.000213623046875,
+  "mean_error_bias_m": 1.0431898832321167,
+  "mae_m": 2.6839656829833984,
+  "rmse_m": 3.817392587661743,
+  "std_m": 3.6720893383026123,
+  "p50_precision_bound_m": 1.92205810546875,
+  "p85_precision_bound_m": 4.789979457855225,
+  "p90_precision_bound_m": 5.67827033996582,
+  "p95_precision_bound_m": 7.590789794921875,
+  "p99_precision_bound_m": 12.136470794677734,
+  "colored_ply_path": "/home/asahichinn/Documents/codes/pointCloudProcessor/utils/verify/ground_correction_verify/reconstructed_error_colored.ply"
+}

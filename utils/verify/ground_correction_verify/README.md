@@ -93,3 +93,45 @@ python simulate_radar_scan.py -i ./output_ground_meshes -o ./output_scanned_poin
 # 指定点数（默认 15000）与微小测距噪声
 python simulate_radar_scan.py -i ./output_ground_meshes -o ./output_scanned_pointclouds --target_points 15000 --noise 0.05
 ```
+
+---
+
+## 3. 地面重建精度评估脚本 (`evaluate_ground_reconstruction.py`)
+
+### 3.1 评估原理与核心机制
+- **扇面区域过滤 (Sector Mask)**：
+  - 以机载雷达安装的长边中心点为基准站位，严格提取水平 $120^\circ$ 扇面覆盖范围；
+  - **仅对比落在点云实际覆盖扇面内的重建效果**，避免未扫描的盲区干扰评价结果。
+- **高精度垂直投影真值查询**：
+  - 对扇面内重建模型的每个评估点 $(X, Y)$，使用 Open3D `RaycastingScene` 向下垂直投射光线，精确获取原始地面基准高程 $Z_{truth}$；
+  - 垂直误差计算：$e = Z_{recon} - Z_{truth}$。
+- **核心评价指标**：
+  1. **最大误差点**：偏高最严重误差点（Max Positive Error）及最大绝对误差点（Worst-case Point）的三维坐标与高程差；
+  2. **最小误差点**：偏低最严重误差点（Min Negative Error）及最小绝对误差点（最吻合点）的三维坐标与高程差；
+  3. **平均误差统计**：平均系统偏差（Bias）、平均绝对误差（MAE）、均方根误差（RMSE）与标准差（Std）；
+  4. **85% 精准度误差范围 (P85)**：计算绝对误差的第 85 百分位数，给出“在 $\pm \epsilon_{85}$ 米误差范围内，地面重建精度达到 85%”的定量结论（同时输出 P50、P90、P95、P99 与阶梯累计分布）；
+  5. **误差彩色模型导出**：
+     - **红色**：代表偏高（$Z_{recon} > Z_{truth}$），误差越大红色越深；
+     - **蓝色**：代表偏低（$Z_{recon} < Z_{truth}$），误差越大蓝色越深；
+     - **白色**：代表无误差或误差极小（$Z_{recon} \approx Z_{truth}$）；
+     - 扇面外背景点：浅灰色；
+     - 支持 `--crop_sector` 额外保存纯扇面内的裁剪 `.ply` 网格/点云。
+
+### 3.2 命令行参数与运行示例
+```bash
+# 基本用法：输入原始地面与重建地面，自动定位长边中心扇面并评估
+python evaluate_ground_reconstruction.py \
+    -g ./output_ground_meshes/ground_terrain_001_perlin_fbm.ply \
+    -r ./reconstructed_mesh.ply \
+    -o ./reconstructed_error_colored.ply
+
+# 传入雷达扫描点云作为辅助参考，并导出纯扇面裁剪模型与 JSON 指标
+python evaluate_ground_reconstruction.py \
+    -g ./output_ground_meshes/ground_terrain_001_perlin_fbm.ply \
+    -r ./reconstructed_mesh.ply \
+    -p ./output_scanned_pointclouds/scanned_pcd_ground_terrain_001_perlin_fbm.ply \
+    -o ./reconstructed_error_colored.ply \
+    --crop_sector \
+    --save_json ./eval_report.json
+```
+
