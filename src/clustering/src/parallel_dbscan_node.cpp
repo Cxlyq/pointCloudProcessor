@@ -46,8 +46,11 @@ public:
         enable_range_balancing_ = this->get_parameter("enable_range_balancing").as_bool();
 
         // 2. 创建订阅者与发布者
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
         subscription_ = this->create_subscription<pc_msgs::msg::O3DPointCloud>(
-            sub_topic, 10, std::bind(&ParallelDbscanNode::pointcloud_callback, this, _1)
+            sub_topic, qos, std::bind(&ParallelDbscanNode::pointcloud_callback, this, _1)
         );
 
         publisher_ = this->create_publisher<pc_msgs::msg::ClusteredPointCloud>(pub_topic, 10);

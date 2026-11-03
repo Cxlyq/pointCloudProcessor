@@ -528,9 +528,12 @@ public:
         }
 
         // 3. 订阅话题 (运行在 ROS 线程)
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
         subscription_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
             sub_topic,
-            rclcpp::QoS(rclcpp::KeepLast(1)),
+            qos,
             std::bind(&VisualizationNode::mesh_callback, this, _1)
         );
 

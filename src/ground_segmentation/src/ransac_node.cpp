@@ -36,8 +36,11 @@ public:
         num_iters_ = this->get_parameter("num_iterations").as_int();
 
         // 2. 创建订阅者与发布者
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
         subscription_ = this->create_subscription<pc_msgs::msg::O3DPointCloud>(
-            sub_topic, 10, std::bind(&RansacNode::pointcloud_callback, this, _1)
+            sub_topic, qos, std::bind(&RansacNode::pointcloud_callback, this, _1)
         );
 
         ground_pub_ = this->create_publisher<pc_msgs::msg::O3DPointCloud>(pub_g_topic, 10);

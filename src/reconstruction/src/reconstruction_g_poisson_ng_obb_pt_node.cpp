@@ -207,9 +207,12 @@ public:
         // 5. 创建三路时间同步订阅者
         // 上游三路消息（地面点云 / 聚类点云 / 载机状态）共享同一时间戳，
         // 使用 ApproximateTime + 较小 slop 保证帧级对应，防止跨帧错配
-        ground_sub_.subscribe(this, sub_g_topic);
-        cluster_sub_.subscribe(this, sub_c_topic);
-        plane_state_sub_.subscribe(this, sub_plane_state_topic_);
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
+        ground_sub_.subscribe(this, sub_g_topic, qos.get_rmw_qos_profile());
+        cluster_sub_.subscribe(this, sub_c_topic, qos.get_rmw_qos_profile());
+        plane_state_sub_.subscribe(this, sub_plane_state_topic_, qos.get_rmw_qos_profile());
 
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
             SyncPolicy(10), ground_sub_, cluster_sub_, plane_state_sub_);

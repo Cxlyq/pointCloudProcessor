@@ -247,8 +247,12 @@ public:
         if (!pub_map_pc_topic_.empty()) {
             pub_map_pc_ = this->create_publisher<pc_msgs::msg::O3DPointCloud>(pub_map_pc_topic_, 10);
         }
+
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
         sub_mesh_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
-            sub_mesh_topic_, 10,
+            sub_mesh_topic_, qos,
             std::bind(&FlowAlignmentNode::mesh_callback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),

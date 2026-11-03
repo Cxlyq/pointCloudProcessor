@@ -84,8 +84,11 @@ public:
         }
 
         // 2. 创建消息同步订阅器
-        ground_sub_.subscribe(this, sub_g_topic);
-        cluster_sub_.subscribe(this, sub_c_topic);
+        auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
+            .reliable()
+            .durability_volatile();
+        ground_sub_.subscribe(this, sub_g_topic, qos.get_rmw_qos_profile());
+        cluster_sub_.subscribe(this, sub_c_topic, qos.get_rmw_qos_profile());
 
         // 队列大小设为 10
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), ground_sub_, cluster_sub_);
