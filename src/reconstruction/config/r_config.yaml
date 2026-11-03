@@ -86,6 +86,14 @@ reconstruction_g_poisson_ng_obb_pt_node:
     # ── 三路同步器容错时间（秒）──────────────────────────────────────────
     # 上游三路消息共享同一时间戳，此处设较小值作安全冗余；设置过大会引入帧错位
     sync_slop_sec: 0.05
+    # ── 是否使用地面模型估计高压塔高度 ──────────────────────────────────
+    # false: 完全依赖 QueryNearbyTowers.srv 提供的经纬高信息
+    # true: 当前 srv 提供的高度信息无效，从地面模型获取高压塔所在位置的地面高度作为高压塔高度插入
+    use_estimated_powertower_z: true
+    # ── 高压塔地面依托搜索容差（米）────────────────────────────────────
+    # 仅当高压塔位于地面模型内，或距地面模型水平距离 <= 此阈值时才认为有地面依托；
+    # 落在无人机后方或视场外没有地面依托的高压塔将不予插入显示。
+    tower_ground_search_radius: 25.0
     # 高压塔 .ply 模型路径（节点启动时一次性载入内存）
     # 请修改为实际模型路径
     tower_model_path: "/home/asahichinn/Documents/codes/pointCloudProcessor/assets/power-transmission-tower/powerTransmissionTower_optimized9.ply"
@@ -95,18 +103,17 @@ reconstruction_g_poisson_ng_obb_pt_node:
     tower_model_color: [0.8, 0.5, 0.1]
     # 高压塔模型旋转矩阵（行优先，3×3 展开为 9 个元素）
     # 含义：插入模型前，先将模型顶点乘以此矩阵再平移到目标位置
-    # 默认值为单位矩阵（不旋转）；
-    # 示例：绕 Z 轴旋转 90°:
-    #   [0, -1, 0,
-    #    1,  0, 0,
-    #    0,  0, 1]
+    # 绕 X 轴旋转 90°:
+    #   [ 1,  0,  0,
+    #     0,  0, -1,
+    #     0,  1,  0]
     tower_model_rotation_deg:
       - 1.0
       - 0.0
       - 0.0
       - 0.0
+      - 0.0
+      - -1.0
+      - 0.0
       - 1.0
       - 0.0
-      - 0.0
-      - 0.0
-      - 1.0

@@ -13,7 +13,9 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -122,6 +124,10 @@ public:
         // 三路同步器容错时间（秒），默认 0.05 s（50 ms）
         // 上游三路消息使用相同时间戳，此值仅作安全冗余；设置过大会引入帧错位
         this->declare_parameter<double>("sync_slop_sec", 0.05);
+        // 是否使用地面模型估计高压塔高度
+        this->declare_parameter<bool>("use_estimated_powertower_z", true);
+        // 高压塔地面依托搜索容差（米）
+        this->declare_parameter<double>("tower_ground_search_radius", 25.0);
         // 高压塔 .ply 模型路径
         this->declare_parameter<std::string>("tower_model_path", "");
         // 高压塔模型旋转矩阵（角度制，行优先存储的 3x3 展开为 9 个 double）
@@ -158,6 +164,8 @@ public:
         tower_query_service_   = this->get_parameter("tower_query_service").as_string();
         tower_query_radius_km_ = this->get_parameter("tower_query_radius_km").as_double();
         sync_slop_sec_         = this->get_parameter("sync_slop_sec").as_double();
+        use_estimated_powertower_z_ = this->get_parameter("use_estimated_powertower_z").as_bool();
+        tower_ground_search_radius_ = this->get_parameter("tower_ground_search_radius").as_double();
         tower_model_path_      = this->get_parameter("tower_model_path").as_string();
         tower_model_scale_     = this->get_parameter("tower_model_scale").as_double();
 
@@ -291,12 +299,17 @@ private:
                 tower_mesh_->Scale(tower_model_scale_, tower_mesh_->GetCenter());
             }
 
-            // 将模型平移到原点（后续在插入时再平移到目标位置）
-            const Eigen::Vector3d center = tower_mesh_->GetCenter();
-            tower_mesh_->Translate(-center);
-
-            // 旋转（施加用户配置的旋转矩阵）
+            // 将模型中心对齐到原点并施加旋转
+            const Eigen::Vector3d raw_center = tower_mesh_->GetCenter();
+            tower_mesh_->Translate(-raw_center);
             tower_mesh_->Rotate(tower_rotation_, Eigen::Vector3d::Zero());
+
+            // 将旋转后的模型底部（Z 轴最低点）对齐到 Z = 0，XY 水平中心对齐到 (0, 0)
+            // 确保高压塔模型底座贴合在 Z=0 平面，使插入时 target_pos.z 即为塔基地面高度，
+            // 彻底解决高压塔模型"一半在地面上、一半在地面下"的问题
+            const Eigen::Vector3d min_bound = tower_mesh_->GetMinBound();
+            const Eigen::Vector3d cur_center = tower_mesh_->GetCenter();
+            tower_mesh_->Translate(Eigen::Vector3d(-cur_center.x(), -cur_center.y(), -min_bound.z()));
 
             // 赋色
             tower_mesh_->PaintUniformColor(tower_color_);
@@ -333,9 +346,11 @@ private:
         int  valid_hull_count    = 0;
         bool ground_reconstructed = false;
 
+        std::shared_ptr<open3d::geometry::PointCloud> ground_pcd = nullptr;
+
         // ─── 阶段 1：地面 Poisson 重建 ────────────────────────────────────
         if (ground_points_count > 0) {
-            auto ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
+            ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
             ground_pcd->points_.reserve(ground_points_count);
             for (size_t i = 0; i < ground_points_count; ++i) {
                 ground_pcd->points_.emplace_back(
@@ -417,7 +432,7 @@ private:
         }
 
         // ─── 阶段 3：高压塔白模插入（使用与本帧同步的载机状态）──────────
-        insert_power_towers(combined_mesh, plane_state_msg);
+        insert_power_towers(combined_mesh, plane_state_msg, final_terrain_mesh, ground_pcd);
 
         // ─── 阶段 4：本地文件保存 ─────────────────────────────────────────
         if (!data_saved_dir_.empty()) {
@@ -491,10 +506,147 @@ private:
             r_frame_seq, out_msg.vertices.size() / 3, out_msg.triangles.size() / 3, elapsed_ms);
     }
 
+    // ── 从地面模型获取指定 (target_x, target_y) 处的地面高度 ─────────────
+    // 若 target 位于地面三角网格内，返回重心插值高度；
+    // 若在 max_dist 阈值范围内，返回反距离加权高度；
+    // 若超出地面模型依托范围（如在视场后方或盲区），返回 std::nullopt
+    std::optional<double> get_ground_height_at(
+        double target_x, double target_y,
+        const std::shared_ptr<open3d::geometry::TriangleMesh>& terrain_mesh,
+        const std::shared_ptr<open3d::geometry::PointCloud>& ground_pcd,
+        double max_dist_threshold) const
+    {
+        // 1. 若有重建出的地面网格，优先进行 2D 三角形包含判定与重心坐标插值
+        if (terrain_mesh && !terrain_mesh->vertices_.empty() && !terrain_mesh->triangles_.empty()) {
+            const auto& vertices = terrain_mesh->vertices_;
+            const auto& triangles = terrain_mesh->triangles_;
+
+            // 1.1 先做整体 2D 边界盒（AABB）粗筛：若远在地面网格外，直接判定无地面依托
+            double g_min_x = std::numeric_limits<double>::infinity();
+            double g_max_x = -std::numeric_limits<double>::infinity();
+            double g_min_y = std::numeric_limits<double>::infinity();
+            double g_max_y = -std::numeric_limits<double>::infinity();
+
+            for (const auto& v : vertices) {
+                if (v.x() < g_min_x) g_min_x = v.x();
+                if (v.x() > g_max_x) g_max_x = v.x();
+                if (v.y() < g_min_y) g_min_y = v.y();
+                if (v.y() > g_max_y) g_max_y = v.y();
+            }
+
+            if (target_x < g_min_x - max_dist_threshold || target_x > g_max_x + max_dist_threshold ||
+                target_y < g_min_y - max_dist_threshold || target_y > g_max_y + max_dist_threshold) {
+                // 超出地面网格整体包围盒容差范围（例如在无人机视角后方），无地面依托
+                return std::nullopt;
+            }
+
+            // 1.2 遍历三角面片进行精确包含测试
+            for (const auto& tri : triangles) {
+                const auto& A = vertices[static_cast<size_t>(tri.x())];
+                const auto& B = vertices[static_cast<size_t>(tri.y())];
+                const auto& C = vertices[static_cast<size_t>(tri.z())];
+
+                double min_x = std::min({A.x(), B.x(), C.x()});
+                double max_x = std::max({A.x(), B.x(), C.x()});
+                double min_y = std::min({A.y(), B.y(), C.y()});
+                double max_y = std::max({A.y(), B.y(), C.y()});
+
+                if (target_x < min_x - 1e-3 || target_x > max_x + 1e-3 ||
+                    target_y < min_y - 1e-3 || target_y > max_y + 1e-3) {
+                    continue;
+                }
+
+                double denom = (B.y() - C.y()) * (A.x() - C.x()) + (C.x() - B.x()) * (A.y() - C.y());
+                if (std::abs(denom) > 1e-9) {
+                    double wA = ((B.y() - C.y()) * (target_x - C.x()) + (C.x() - B.x()) * (target_y - C.y())) / denom;
+                    double wB = ((C.y() - A.y()) * (target_x - C.x()) + (A.x() - C.x()) * (target_y - C.y())) / denom;
+                    double wC = 1.0 - wA - wB;
+
+                    if (wA >= -1e-4 && wB >= -1e-4 && wC >= -1e-4) {
+                        return wA * A.z() + wB * B.z() + wC * C.z();
+                    }
+                }
+            }
+
+            // 1.3 若未严格落入三角面片内部，在 max_dist_threshold 容差范围内搜索最近顶点
+            const double max_dist_sq = max_dist_threshold * max_dist_threshold;
+            struct Neighbor {
+                double dist_sq;
+                double z;
+            };
+            std::vector<Neighbor> nearest;
+            nearest.reserve(4);
+
+            for (const auto& v : vertices) {
+                double dx = v.x() - target_x;
+                double dy = v.y() - target_y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 > max_dist_sq) continue;
+
+                if (nearest.size() < 4) {
+                    nearest.push_back({d2, v.z()});
+                    if (nearest.size() == 4) {
+                        std::sort(nearest.begin(), nearest.end(), [](const Neighbor& a, const Neighbor& b) {
+                            return a.dist_sq < b.dist_sq;
+                        });
+                    }
+                } else if (d2 < nearest.back().dist_sq) {
+                    nearest.back() = {d2, v.z()};
+                    std::sort(nearest.begin(), nearest.end(), [](const Neighbor& a, const Neighbor& b) {
+                        return a.dist_sq < b.dist_sq;
+                    });
+                }
+            }
+
+            if (!nearest.empty()) {
+                if (nearest.front().dist_sq < 1e-4) {
+                    return nearest.front().z;
+                }
+                double weight_sum = 0.0;
+                double z_weighted = 0.0;
+                for (const auto& nb : nearest) {
+                    double w = 1.0 / (nb.dist_sq + 1e-6);
+                    weight_sum += w;
+                    z_weighted += w * nb.z;
+                }
+                return z_weighted / weight_sum;
+            }
+
+            // 最近顶点距离仍超过容差阈值，判定为无地面依托
+            return std::nullopt;
+        }
+
+        // 2. 若地面网格为空，回退检查地面点云
+        if (ground_pcd && !ground_pcd->points_.empty()) {
+            const double max_dist_sq = max_dist_threshold * max_dist_threshold;
+            double min_dist_sq = std::numeric_limits<double>::infinity();
+            double closest_z = 0.0;
+            bool found = false;
+
+            for (const auto& pt : ground_pcd->points_) {
+                double dx = pt.x() - target_x;
+                double dy = pt.y() - target_y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < min_dist_sq && d2 <= max_dist_sq) {
+                    min_dist_sq = d2;
+                    closest_z = pt.z();
+                    found = true;
+                }
+            }
+            if (found) {
+                return closest_z;
+            }
+        }
+
+        return std::nullopt;
+    }
+
     // ── 高压塔插入：查询 Service → GPS→ENU → 插入模型 ────────────────────
     void insert_power_towers(
         std::shared_ptr<open3d::geometry::TriangleMesh>& combined_mesh,
-        const pc_msgs::msg::PlaneState::ConstSharedPtr& plane_state)
+        const pc_msgs::msg::PlaneState::ConstSharedPtr& plane_state,
+        const std::shared_ptr<open3d::geometry::TriangleMesh>& terrain_mesh,
+        const std::shared_ptr<open3d::geometry::PointCloud>& ground_pcd)
     {
         if (!tower_model_loaded_ || !tower_mesh_) {
             return; // 模型未加载，跳过
@@ -538,8 +690,7 @@ private:
         }
 
         const size_t n_towers = response->latitudes.size();
-        RCLCPP_INFO(this->get_logger(),
-            "[*] Inserting %zu power tower model(s) into the scene.", n_towers);
+        size_t inserted_count = 0;
 
         for (size_t i = 0; i < n_towers; ++i) {
             // GPS → ENU（以本帧载机位置为原点）
@@ -548,11 +699,30 @@ private:
                 plane_state->latitude,  plane_state->longitude,  plane_state->altitude,
                 response->latitudes[i], response->longitudes[i], response->altitudes[i]);
 
+            Eigen::Vector3d target_pos = enu;
+            if (use_estimated_powertower_z_) {
+                // 当前 srv 提供的高度信息无效，从地面模型获取高压塔所在位置的地面高度
+                auto ground_z = get_ground_height_at(
+                    enu.x(), enu.y(), terrain_mesh, ground_pcd, tower_ground_search_radius_);
+                if (!ground_z.has_value()) {
+                    // 无地面依托（如位于无人机视角后方或激光雷达地面扫描范围外），跳过不显示
+                    continue;
+                }
+                target_pos.z() = *ground_z;
+            }
+
             // 复制模板网格并平移到目标位置
             auto tower_instance = std::make_shared<open3d::geometry::TriangleMesh>(*tower_mesh_);
-            tower_instance->Translate(enu);
+            tower_instance->Translate(target_pos);
 
             *combined_mesh += *tower_instance;
+            ++inserted_count;
+        }
+
+        if (inserted_count > 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "[*] Inserting %zu power tower model(s) into the scene (queried %zu).",
+                inserted_count, n_towers);
         }
     }
 
@@ -573,6 +743,8 @@ private:
     std::string tower_query_service_;
     double      tower_query_radius_km_;
     double      sync_slop_sec_;
+    bool        use_estimated_powertower_z_{true};
+    double      tower_ground_search_radius_{25.0};
     std::string tower_model_path_;
     double      tower_model_scale_;
     Eigen::Matrix3d tower_rotation_;
