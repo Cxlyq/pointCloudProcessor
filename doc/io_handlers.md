@@ -1,120 +1,174 @@
 # io_handlers 节点说明文档
 
-`io_handlers` 是点云处理流水线的数据输入输出（IO）控制功能包。该功能包负责从本地存储中载入激光雷达（LiDAR）点云数据集，并将其序列化转换为 ROS 2 自定义消息格式，按指定的频率周期性模拟发布实时激光雷达点云数据流。
+`io_handlers` 是点云处理流水线的输入适配与仿真数据源功能包。它主要负责从本地数据集目录中读取按时间序列排列的雷达点云（`.ply` 文件）、载机空间运动轨迹（`extend_data.json`）以及输电高压铁塔地理信息（`powerLineGPS.json`），提供内存全量预加载、定时恒频发布、载机状态与时间戳对齐，以及基于地理大圆距离（Haversine）的高压铁塔空间检索服务，为整条处理流水线提供真实高效的数据注入。
 
 ---
 
-## 1. 节点与可执行文件概览
+## 1. 节点概览与设计目标
 
 | 属性 | 内容 |
 | :--- | :--- |
 | **功能包名称** | `io_handlers` |
-| **可执行文件** | `sim_lidar_data_flow_node` |
-| **主 C++ 类** | `IOHandlerNode` ([sim_lidar_data_flow_node.cpp](file:///home/cx/Documents/codes/pointcloud_607_roscpp/src/io_handlers/src/sim_lidar_data_flow_node.cpp#L28)) |
-| **依赖库** | ROS 2 (`rclcpp`), `pc_msgs`, `Open3D`, `std::filesystem` |
+| **可执行文件** | 1. `sim_lidar_data_flow_node`<br>2. `sim_plane_data_flow_node` |
+| **主 C++ 类** | 1. `IOHandlerNode` ([sim_lidar_data_flow_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/src/sim_lidar_data_flow_node.cpp))<br>2. `SimPlaneDataFlowNode` ([sim_plane_data_flow_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/src/sim_plane_data_flow_node.cpp)) |
+| **核心依赖** | ROS 2 (`rclcpp`), `pc_msgs`, `Open3D`, `nlohmann_json` (header-only) |
+
+### 核心设计目标：
+1. **内存零磁盘 I/O 实时回放**：节点在初始化阶段一次性将目录下的所有 `.ply` 文件解析展平并驻留在内存中（Preload），运行时彻底消除磁盘读写瓶颈，确保按严格时钟定时触发发布。
+2. **多模态传感器时钟精确对齐**：在 `sim_plane_data_flow_node` 中，每帧点云与其对应的经纬高及航向角（`PlaneState`）被打上完全一致的纳秒级系统时间戳（`header.stamp = now_stamp`），为下游 `message_filters` 的多路时间同步提供精准基准。
+3. **基于 Haversine 大圆算法的空间铁塔检索**：提供服务服务端 `QueryNearbyTowers`，支持根据无人机当前经纬度，动态计算地表球面距离，毫秒级筛选出指定半径内的所有高压塔。
+4. **标准化阶段完成日志输出**：严格遵守全局日志规范，每帧发布后输出带有 `[STAGE-DONE]` 标记的日志，方便总控节点 `bringup` 进行吞吐率与丢帧统计。
 
 ---
 
-## 2. 核心算法逻辑与工作流程
+## 2. 核心机制与架构
 
-`sim_lidar_data_flow_node` 节点的生命周期与数据处理流程如下：
+### 2.1 整体架构图
 
 ```
-[本地数据集路径 (dataset_dir)] 
-            │
-            ▼ (std::filesystem 扫描 .ply 文件并按名称排序)
-[PLY 文件列表 (ply_files_)]
-            │
-            ▼ (open3d::io::CreatePointCloudFromFile 预加载)
-[内存帧数据缓存 (frames_data_)]
-            │  └─ 展平 Double(X,Y,Z) -> Float 数组 (points/colors)
-            ▼
-[ROS 2 墙上定时器 (timer_callback)]
-            │  └─ 依据 publish_rate 频率触发
-            ▼
-[发布 pc_msgs::msg::O3DPointCloud 至 /io/raw_pointcloud]
+                       [本地数据集目录 (dataset_dir)]
+                       ├── *.ply 序列点云文件
+                       ├── extend_data.json (载机 GPS / Course)
+                       └── powerLineGPS.json (全量铁塔坐标)
+                                     │
+                     ┌───────────────┴───────────────┐
+                     ▼                               ▼
+       ┌───────────────────────────┐   ┌───────────────────────────┐
+       │ sim_lidar_data_flow_node  │   │ sim_plane_data_flow_node  │
+       │ (纯点云模拟回放)          │   │ (多模态全要素仿真)        │
+       └─────────────┬─────────────┘   └─────────────┬─────────────┘
+                     │                               │
+        /io/raw_pointcloud                           ├── /io/raw_pointcloud (O3DPointCloud)
+       (O3DPointCloud)                               ├── /io/plane/state (PlaneState)
+                     │                               └── /io/query_nearby_towers (Service)
+                     ▼                                               ▲
+          [下游流水线处理各节点]                                      │
+                                                    [reconstruction 等下游节点]
 ```
 
-### 关键步骤细节：
-1. **数据集检索与排序**：节点启动时，通过 `std::filesystem::directory_iterator` 遍历 `dataset_dir` 目录，检索所有扩展名为 `.ply` 的点云文件，并按照文件字典序进行 `std::sort` 排序，确保点云按照时序正确播放。
-2. **高效预加载机制 (`preload_pointclouds`)**：
-   - 采用一次性预加载策略（Preloading），避免在定时器回调中频繁进行磁盘 I/O 导致帧率抖动。
-   - 使用 Open3D 的 `open3d::io::CreatePointCloudFromFile` 读取点云。
-   - 提取 3D 点坐标 $(x, y, z)$ 和颜色数据 $(r, g, b)$，将其从 Open3D 的双精度 `double` 转换为单精度 `float` 并展平放入一维数组 `std::vector<float>` 中。
-   - 内部定义结构体 `FrameData` 存储预展平的数据：
-     ```cpp
-     struct FrameData {
-         std::string file_name;
-         std::vector<float> points;
-         std::vector<float> colors;
-         size_t num_points;
-     };
-     ```
-3. **周期性定时发布与循环逻辑**：
-   - 根据参数 `publish_rate` 创建 `rclcpp::TimerBase` 定时器。
-   - 定时器回调 `timer_callback()` 每次打包当前帧的 `O3DPointCloud` 消息并发布。
-   - 消息的 `header.stamp` 设置为当前 ROS 时钟时间，`header.frame_id` 设为配置的 TF 坐标系。
-   - 当播放至最后一帧时，若 `is_loop == true` 则重置索引 `current_idx_ = 0` 继续循环播放；若为 `false` 则取消定时器停止发布。
+### 2.2 内存预加载机制 (Preload Mechanism)
+为了防止运行时频繁读取几十兆字节的大尺寸 PLY 点云导致帧率波动与定时器抖动，节点在启动时按文件名升序排列遍历目录：
+* 提前解析点坐标与色彩，转为连续的一维紧凑向量 `std::vector<float> points` 与 `colors`；
+* 预先调用 `vector::reserve` 申请内存空间；
+* 预加载完成后，定时器回调仅需直接引用内存数据进行消息发布，计算耗时几乎为 0.00 ms。
+
+### 2.3 Haversine 地理大圆距离检索
+针对球面经纬度定位，节点采用地球平均半径 $R = 6371.0\text{ km}$ 的 Haversine 公式计算两点水平直线距离：
+$$\Delta\sigma = 2 \arcsin\left(\sqrt{\sin^2\left(\frac{\Delta\phi}{2}\right) + \cos(\phi_1)\cos(\phi_2)\sin^2\left(\frac{\Delta\lambda}{2}\right)}\right)$$
+$$d = R \cdot \Delta\sigma$$
+当客户端调用 `QueryNearbyTowers.srv` 时，服务端快速遍历内存中所有高压铁塔，筛选出 $d \le \text{radius\_km}$ 的目标塔并返回。
 
 ---
 
-## 3. ROS 2 通信接口
+## 3. 性能优化与确认信号规范
 
-### 3.1 订阅话题 (Subscribed Topics)
-无（本节点为数据源节点）。
+### 3.1 阶段确认标准日志格式
+节点在成功发送一帧数据后，立即打印标准化完成日志，供 `bringup` 节点监听吞吐率：
 
-### 3.2 发布话题 (Published Topics)
-
-| 话题名称 | 消息类型 | 说明 |
-| :--- | :--- | :--- |
-| `/io/raw_pointcloud` (默认) | [pc_msgs/msg/O3DPointCloud](file:///home/cx/Documents/codes/pointcloud_607_roscpp/src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云数据流，包含坐标与可选颜色信息 |
-
-### 3.3 关联消息数据结构 (`pc_msgs::msg::O3DPointCloud`)
-```protobuf
-std_msgs/Header header   # 包含 stamp 时间戳与 frame_id 坐标系
-float32[] points        # 展平的点坐标数组 [x0, y0, z0, x1, y1, z1, ...]
-float32[] colors        # 展平的 RGB 颜色数组 [r0, g0, b0, r1, g1, b1, ...] (可选)
+```text
+[STAGE-DONE] io_handlers: Frame %zu published | File: '%s' | Points: %zu | Time: 0.00 ms
 ```
+
+* **示例输出**：
+  ```text
+  [sim_lidar_data_flow_node-1] [STAGE-DONE] io_handlers: Frame 0 published | File: '000000.ply' | Points: 284160 | Time: 0.00 ms
+  ```
 
 ---
 
-## 4. 参数配置说明
+## 4. 通信接口
 
-配置文件位于 [io_handlers/config/io_config.yaml](file:///home/cx/Documents/codes/pointcloud_607_roscpp/src/io_handlers/config/io_config.yaml)。
+### 4.1 发布话题 (Published Topics)
+
+| 节点 | 话题名称 | 消息类型 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `sim_lidar_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
+| `sim_plane_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
+| `sim_plane_data_flow_node` | `/io/plane/state` (可配) | [pc_msgs/msg/PlaneState](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/PlaneState.msg) | 载机经纬度、海拔与航向状态 |
+
+### 4.2 提供服务 (Services)
+
+| 节点 | 服务名称 | 服务类型 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `sim_plane_data_flow_node` | `/io/query_nearby_towers` (可配) | [pc_msgs/srv/QueryNearbyTowers](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/srv/QueryNearbyTowers.srv) | 接收载机经纬度，返回范围内的所有高压铁塔列表 |
+
+---
+
+## 5. 参数配置说明
+
+配置文件位于 [`src/io_handlers/config/io_config.yaml`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/config/io_config.yaml)。
+
+### 5.1 `sim_lidar_data_flow_node` 参数
 
 | 参数名称 | 类型 | 默认值 | 参数功能说明 |
 | :--- | :--- | :--- | :--- |
-| `dataset_dir` | `string` | `""` | 包含 `.ply` 点云文件的本地目录路径 |
-| `publish_rate` | `double` | `2.0` | 点云数据流发布频率（单位：Hz） |
-| `publish_topic` | `string` | `"/io/raw_pointcloud"` | 发布的 ROS 2 点云话题名称 |
-| `frame_id` | `string` | `"map"` | ROS TF 坐标系 ID |
-| `is_loop` | `bool` | `true` | 数据集中所有文件发布完毕后是否循环播放 |
+| `dataset_dir` | `string` | `""` | 包含 `.ply` 文件的输入数据集目录绝对路径 |
+| `publish_rate` | `double` | `0.5` | 点云发布频率（单位：Hz） |
+| `publish_topic` | `string` | `"/io/raw_pointcloud"` | 发布点云的话题名称 |
+| `frame_id` | `string` | `"map"` | ROS 消息坐标系名称 |
+| `is_loop` | `bool` | `false` | 数据播放完毕后是否循环重播（`false` 时发完即停止定时器） |
+
+### 5.2 `sim_plane_data_flow_node` 参数
+
+| 参数名称 | 类型 | 默认值 | 参数功能说明 |
+| :--- | :--- | :--- | :--- |
+| `dataset_dir` | `string` | `""` | 数据集根目录（须包含 `extend_data.json` 与 `powerLineGPS.json`） |
+| `publish_rate` | `double` | `0.5` | 点云与载机状态同步发布频率（Hz） |
+| `pointcloud_topic` | `string` | `"/io/raw_pointcloud"` | 点云发布话题 |
+| `plane_state_topic` | `string` | `"/io/plane/state"` | 载机状态（`PlaneState`）发布话题 |
+| `query_service_name` | `string` | `"/io/query_nearby_towers"` | 高压塔空间检索 Service 服务名称 |
+| `frame_id` | `string` | `"map"` | 消息坐标系名称 |
+| `is_loop` | `bool` | `false` | 是否循环播放 |
+| `default_query_radius_km`| `double` | `5.0` | 当 Service 请求中未指定或 `radius_km <= 0` 时的默认检索半径（公里） |
 
 ---
 
-## 5. 启动与使用方式
+## 6. 常用配置与启动脚本
 
-### 5.1 Launch 启动
-可以使用 ROS 2 Launch 脚本一键加载配置参数并启动节点：
+功能包提供了两个开箱即用的 Launch 文件：
+
+### 6.1 纯点云数据回放：[io_simLidarDataFlow.launch.py](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/launch/io_simLidarDataFlow.launch.py)
+用于不需要载机轨迹或铁塔插入的常规单机测试。
+
+### 6.2 载机全模态数据回放：[io_simPlaneDataFlow.launch.py](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/launch/io_simPlaneDataFlow.launch.py)
+用于配合带高压塔白模注入的重建节点（`reconstruction_g_poisson_ng_obb_pt_node`），同时提供点云、GPS 轨迹和铁塔查询服务。
+
+---
+
+## 7. 启动与使用命令参考
+
 ```bash
+# 1. 启动纯雷达点云模拟节点
 ros2 launch io_handlers io_simLidarDataFlow.launch.py
+
+# 2. 启动载机多模态综合数据流节点（推荐）
+ros2 launch io_handlers io_simPlaneDataFlow.launch.py
+
+# 3. 通过命令行查看发布的消息
+ros2 topic echo /io/raw_pointcloud --field header
+ros2 topic echo /io/plane/state
+
+# 4. 手动调用高压铁塔检索服务测试
+ros2 service call /io/query_nearby_towers pc_msgs/srv/QueryNearbyTowers "{latitude: 31.2304, longitude: 121.4737, radius_km: 10.0}"
 ```
 
-### 5.2 Launch 脚本解析
-[io_simLidarDataFlow.launch.py](file:///home/cx/Documents/codes/pointcloud_607_roscpp/src/io_handlers/launch/io_simLidarDataFlow.launch.py) 会自动定位 `io_handlers` 的 `share` 目录，读取并注入 `io_config.yaml` 配置文件中的全部参数。
-
 ---
 
-## 6. 文件结构与索引
+## 8. 文件结构与索引
 
 ```
 src/io_handlers/
-├── CMakeLists.txt
-├── package.xml
+├── CMakeLists.txt                    # 构建工程描述文件
+├── package.xml                       # 包依赖与元信息
 ├── config/
-│   └── io_config.yaml               # 节点配置文件
+│   └── io_config.yaml                # 节点核心配置文件
+├── include/
+│   └── nlohmann/
+│       └── json.hpp                  # header-only JSON 解析库
 ├── launch/
-│   └── io_simLidarDataFlow.launch.py # 节点 Launch 启动文件
+│   ├── io_simLidarDataFlow.launch.py # 纯雷达点云播放启动脚本
+│   └── io_simPlaneDataFlow.launch.py # 综合载机多模态数据播放启动脚本
 └── src/
-    └── sim_lidar_data_flow_node.cpp  # 节点核心源码实现
+    ├── sim_lidar_data_flow_node.cpp  # 纯点云序列回放节点实现
+    └── sim_plane_data_flow_node.cpp  # 载机多模态点云/GPS/铁塔查询服务实现
 ```
