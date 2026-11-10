@@ -6,3 +6,5 @@ cmake-build-debug/
 dataset/
 *.glb
 *.ply
+utils/*.json
+
