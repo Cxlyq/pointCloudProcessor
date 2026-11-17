@@ -1,7 +1,5 @@
 //
 // sim_plane_data_flow_node.cpp
-// Created by cx on 9/14/26.
-//
 // 该节点负责从数据集目录中读取:
 //   1. 雷达点云数据（.ply）—— 按顺序预加载后以固定频率向 topic 发布
 //   2. 载机状态数据（extend_data.json 中的 gps_info）—— 与点云同步打时间戳向另一 topic 发布

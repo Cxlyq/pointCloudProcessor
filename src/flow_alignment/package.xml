@@ -9,7 +9,7 @@
     配准到滑动窗口世界系 map，发布对齐后的白膜 mesh / 窗口点云 / 配准统计。
     算法与 flow_test/demo_flow.cpp 完全一致，仅封装为 ROS 2 节点。
   </description>
-  <maintainer email="trf@example.com">trf</maintainer>
+  <maintainer email="format@email.com">developer</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

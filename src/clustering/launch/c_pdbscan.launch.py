@@ -1,4 +1,4 @@
-#!/home/cx/anaconda3/envs/pointcloud_607_ros2/bin/python
+
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription

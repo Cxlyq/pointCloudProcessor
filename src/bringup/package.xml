@@ -2,9 +2,9 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>bringup</name>
-  <version>0.0.0</version>
+  <version>1.0.0</version>
   <description>Master bringup manager node for Point Cloud Processor</description>
-  <maintainer email="cx3348269780@outlook.com">cx</maintainer>
+  <maintainer email="format@email.com">developer</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

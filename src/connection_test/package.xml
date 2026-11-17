@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>connection_test</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="cxlyq.g@gmail.com">asahichinn</maintainer>
-  <license>TODO: License declaration</license>
+  <version>1.0.0</version>
+  <description>Package for test connection between two boards</description>
+  <maintainer email="format@email.com">developer</maintainer>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>

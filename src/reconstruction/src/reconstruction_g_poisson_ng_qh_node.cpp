@@ -1,6 +1,4 @@
-//
-// Created by cx on 7/7/26.
-//
+
 //
 // Created for hybrid reconstruction (Poisson for ground, ConvexHull/OBB for clusters).
 //

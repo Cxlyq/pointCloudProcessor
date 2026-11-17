@@ -1,6 +1,4 @@
-//
-// Created by cx on 7/14/26.
-//
+
 #include <chrono>
 #include <memory>
 #include <string>

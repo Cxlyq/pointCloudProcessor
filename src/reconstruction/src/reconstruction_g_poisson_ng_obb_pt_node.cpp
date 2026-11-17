@@ -1,7 +1,5 @@
 //
 // reconstruction_g_poisson_ng_obb_pt_node.cpp
-// Created by cx on 9/15/26.
-//
 // 在 reconstruction_g_poisson_ng_obb_node 的基础上，增加高压塔白模插入功能：
 //   - 订阅载机 GPS 状态 topic（来自 io_handlers / sim_plane_data_flow_node）
 //   - 每帧重建完成后，调用 QueryNearbyTowers Service 获取附近高压塔 GPS 列表
