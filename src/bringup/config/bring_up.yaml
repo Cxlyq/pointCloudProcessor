@@ -56,14 +56,14 @@ bringup_node:
     # =========================================================================
 
     # 1. 最终可视化节点 (消费 /flow/aligned_mesh)
-    visualization_enable: true
+    visualization_enable: false
     visualization_priority: 1
     visualization_show_output: true
     visualization_log_level: ""
     visualization_launch: "v_vis.launch.py"
 
     # 2. 流式配准节点 (消费 /reconstruction/white_mesh, 生产 /flow/aligned_mesh)
-    flow_alignment_enable: true
+    flow_alignment_enable: false
     flow_alignment_priority: 2
     flow_alignment_show_output: true
     flow_alignment_log_level: ""

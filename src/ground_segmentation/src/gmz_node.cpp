@@ -28,6 +28,9 @@ public:
 
         this->declare_parameter<double>("grid_size", 5.0);
         this->declare_parameter<double>("height_threshold", 0.3);
+        this->declare_parameter<bool>("enable_outlier_suppression", true);
+        this->declare_parameter<double>("outlier_z_threshold", 3.0);
+        this->declare_parameter<bool>("enable_slope_interpolation", true);
 
         this->declare_parameter<std::string>("data_saved_dir", "/home");
         this->declare_parameter<bool>("enable_sparse_ground_points_saving", false);
@@ -40,6 +43,9 @@ public:
 
         grid_size_ = this->get_parameter("grid_size").as_double();
         height_threshold_ = this->get_parameter("height_threshold").as_double();
+        enable_outlier_suppression_ = this->get_parameter("enable_outlier_suppression").as_bool();
+        outlier_z_threshold_ = this->get_parameter("outlier_z_threshold").as_double();
+        enable_slope_interpolation_ = this->get_parameter("enable_slope_interpolation").as_bool();
         data_saved_dir_ = this->get_parameter("data_saved_dir").as_string();
         enable_sparse_ground_points_saving_ = this->get_parameter("enable_sparse_ground_points_saving").as_bool();
         enable_ground_points_saving_ = this->get_parameter("enable_ground_points_saving").as_bool();
@@ -57,7 +63,11 @@ public:
         non_ground_pub_ = this->create_publisher<pc_msgs::msg::O3DPointCloud>(pub_ng_topic, 10);
 
         RCLCPP_INFO(this->get_logger(), "[*] GMZ (Grid Minimum Z) node brought up. Listening on: %s...", sub_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "[*] Parameters - grid_size: %.2f m, height_threshold: %.2f m", grid_size_, height_threshold_);
+        RCLCPP_INFO(this->get_logger(),
+            "[*] Parameters - grid_size: %.2f m, height_threshold: %.2f m, outlier_suppression: %s (thr=%.2f m), slope_interp: %s",
+            grid_size_, height_threshold_,
+            enable_outlier_suppression_ ? "true" : "false", outlier_z_threshold_,
+            enable_slope_interpolation_ ? "true" : "false");
     }
 
 private:
@@ -129,18 +139,122 @@ private:
             }
         }
 
-        // 提取待重建地面点 (每个网格唯一的最低点)
+        // 3.2a 邻域极低异常点抑制 & 提取待重建稀疏地面点
+        std::unordered_map<uint64_t, double> clean_z_map;
+        clean_z_map.reserve(grid_min_pt_idx_map.size());
+
         auto sparse_ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
         sparse_ground_pcd->points_.reserve(grid_min_pt_idx_map.size());
         if (has_colors) sparse_ground_pcd->colors_.reserve(grid_min_pt_idx_map.size());
 
         for (const auto& pair : grid_min_pt_idx_map) {
-            size_t idx = pair.second;
-            sparse_ground_pcd->points_.push_back(pcd->points_[idx]);
+            const uint64_t key = pair.first;
+            const size_t idx = pair.second;
+            const auto& raw_pt = pcd->points_[idx];
+            double clean_z = raw_pt.z();
+
+            if (enable_outlier_suppression_) {
+                const int64_t gx = static_cast<int64_t>(key >> 32);
+                const int64_t gy = static_cast<int64_t>(key & 0xFFFFFFFFULL);
+                double nz[8];
+                int n_cnt = 0;
+
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        if (dx == 0 && dy == 0) continue;
+                        const int64_t nx = gx + dx;
+                        const int64_t ny = gy + dy;
+                        if (nx < 0 || ny < 0) continue;
+                        const uint64_t nkey = (static_cast<uint64_t>(nx) << 32) | static_cast<uint64_t>(ny);
+                        auto nit = grid_min_pt_idx_map.find(nkey);
+                        if (nit != grid_min_pt_idx_map.end()) {
+                            nz[n_cnt++] = pcd->points_[nit->second].z();
+                        }
+                    }
+                }
+
+                if (n_cnt >= 3) {
+                    std::sort(nz, nz + n_cnt);
+                    const double med_z = (n_cnt % 2 == 1)
+                        ? nz[n_cnt / 2]
+                        : 0.5 * (nz[n_cnt / 2 - 1] + nz[n_cnt / 2]);
+                    if (clean_z < med_z - outlier_z_threshold_) {
+                        clean_z = med_z - outlier_z_threshold_;
+                    }
+                }
+            }
+
+            clean_z_map[key] = clean_z;
+            sparse_ground_pcd->points_.emplace_back(raw_pt.x(), raw_pt.y(), clean_z);
             if (has_colors) sparse_ground_pcd->colors_.push_back(pcd->colors_[idx]);
         }
 
-        // 3.3 第二遍遍历：根据最低点 + 阈值剔除所有附着在地面的点，只保留悬浮的非地面点用于聚类
+        // 3.2b 预计算每个网格的 3x3 局部坡面模型
+        struct CellSlopeModel {
+            Eigen::Vector3d own_pt;
+            Eigen::Vector2d grad{0.0, 0.0};
+            double max_neighbor_z{0.0};
+            Eigen::Vector3d neighbors[9];
+            int neighbor_count{0};
+        };
+
+        std::unordered_map<uint64_t, CellSlopeModel> cell_model_map;
+        cell_model_map.reserve(grid_min_pt_idx_map.size());
+
+        for (const auto& pair : grid_min_pt_idx_map) {
+            const uint64_t key = pair.first;
+            const size_t idx = pair.second;
+            const auto& own_raw_pt = pcd->points_[idx];
+
+            CellSlopeModel model;
+            model.own_pt = Eigen::Vector3d(own_raw_pt.x(), own_raw_pt.y(), clean_z_map[key]);
+            model.max_neighbor_z = model.own_pt.z();
+
+            if (enable_slope_interpolation_) {
+                const int64_t gx = static_cast<int64_t>(key >> 32);
+                const int64_t gy = static_cast<int64_t>(key & 0xFFFFFFFFULL);
+
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        const int64_t nx = gx + dx;
+                        const int64_t ny = gy + dy;
+                        if (nx < 0 || ny < 0) continue;
+                        const uint64_t nkey = (static_cast<uint64_t>(nx) << 32) | static_cast<uint64_t>(ny);
+                        auto nit = grid_min_pt_idx_map.find(nkey);
+                        if (nit != grid_min_pt_idx_map.end()) {
+                            const auto& n_raw_pt = pcd->points_[nit->second];
+                            const Eigen::Vector3d npt(n_raw_pt.x(), n_raw_pt.y(), clean_z_map[nkey]);
+                            model.neighbors[model.neighbor_count++] = npt;
+                            model.max_neighbor_z = std::max(model.max_neighbor_z, npt.z());
+                        }
+                    }
+                }
+
+                if (model.neighbor_count >= 3) {
+                    double sxx = 1e-3, sxy = 0.0, syy = 1e-3;
+                    double sxz = 0.0, syz = 0.0;
+                    for (int k = 0; k < model.neighbor_count; ++k) {
+                        const double dx = model.neighbors[k].x() - model.own_pt.x();
+                        const double dy = model.neighbors[k].y() - model.own_pt.y();
+                        const double dz = model.neighbors[k].z() - model.own_pt.z();
+                        sxx += dx * dx;
+                        sxy += dx * dy;
+                        syy += dy * dy;
+                        sxz += dx * dz;
+                        syz += dy * dz;
+                    }
+                    const double det = sxx * syy - sxy * sxy;
+                    if (std::abs(det) > 1e-9) {
+                        model.grad.x() = (syy * sxz - sxy * syz) / det;
+                        model.grad.y() = (sxx * syz - sxy * sxz) / det;
+                    }
+                }
+            }
+
+            cell_model_map.emplace(key, model);
+        }
+
+        // 3.3 第二遍遍历：基于连续坡面估计高度切分非地面点，同时滤除深层地下噪点
         auto non_ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
         auto ground_pcd = std::make_shared<open3d::geometry::PointCloud>();
 
@@ -157,21 +271,41 @@ private:
             uint32_t grid_y = static_cast<uint32_t>(std::floor((pt.y() - min_y) / grid_size_));
             uint64_t key = (static_cast<uint64_t>(grid_x) << 32) | grid_y;
 
-            double min_z = pcd->points_[grid_min_pt_idx_map[key]].z();
+            const auto& model = cell_model_map.at(key);
+            const double own_z = model.own_pt.z();
+            double ref_ground_z = own_z;
 
-            // 判断是否在厚度阈值范围内，如果不属于地面厚度区间，则是纯粹的非地面点
-            if (pt.z() > (min_z + height_threshold_)) {
+            if (enable_slope_interpolation_) {
+                const double plane_raw = own_z
+                    + model.grad.x() * (pt.x() - model.own_pt.x())
+                    + model.grad.y() * (pt.y() - model.own_pt.y());
+                const double plane_z = std::clamp(plane_raw, own_z, model.max_neighbor_z);
+
+                double idw_z = own_z;
+                if (model.neighbor_count >= 2) {
+                    double w_sum = 0.0;
+                    double wz_sum = 0.0;
+                    for (int k = 0; k < model.neighbor_count; ++k) {
+                        const double dx = model.neighbors[k].x() - pt.x();
+                        const double dy = model.neighbors[k].y() - pt.y();
+                        const double w = 1.0 / (dx * dx + dy * dy + 1.0);
+                        w_sum += w;
+                        wz_sum += w * model.neighbors[k].z();
+                    }
+                    idw_z = wz_sum / w_sum;
+                }
+
+                ref_ground_z = std::max({own_z, idw_z, plane_z});
+            }
+
+            // 高度阈值切分：高于坡面估计高程 + 阈值为非地面点；低于最低点 - 阈值的深层地下噪点丢弃
+            if (pt.z() > (ref_ground_z + height_threshold_)) {
                 non_ground_pcd->points_.push_back(pt);
                 if (has_colors) non_ground_pcd->colors_.push_back(pcd->colors_[i]);
-            }else{
+            } else if (pt.z() >= (own_z - height_threshold_)) {
                 ground_pcd->points_.push_back(pt);
                 if (has_colors) ground_pcd->colors_.push_back(pcd->colors_[i]);
             }
-        }
-
-        if (non_ground_pcd->points_.empty()) {
-            RCLCPP_WARN(this->get_logger(), "[?] Empty non-ground point cloud. Scaped publish.");
-            return;
         }
 
         // 4. 序列化：Open3D 点云转 ROS 2 消息并发布
@@ -198,26 +332,30 @@ private:
             ground_pub_->publish(ground_msg);
         }
 
-        // 发布非地面点云
-        auto non_ground_msg = pc_msgs::msg::O3DPointCloud();
-        non_ground_msg.header = msg->header;
+        // 发布非地面点云（若为空则仅发布地面点云并告警）
+        if (non_ground_pcd->points_.empty()) {
+            RCLCPP_WARN(this->get_logger(), "[?] Empty non-ground point cloud. Ground published, skipped non-ground publish.");
+        } else {
+            auto non_ground_msg = pc_msgs::msg::O3DPointCloud();
+            non_ground_msg.header = msg->header;
 
-        non_ground_msg.points.reserve(non_ground_pcd->points_.size() * 3);
-        for (const auto& point : non_ground_pcd->points_) {
-            non_ground_msg.points.push_back(static_cast<float>(point.x()));
-            non_ground_msg.points.push_back(static_cast<float>(point.y()));
-            non_ground_msg.points.push_back(static_cast<float>(point.z()));
-        }
-
-        if (has_colors) {
-            non_ground_msg.colors.reserve(non_ground_pcd->colors_.size() * 3);
-            for (const auto& color : non_ground_pcd->colors_) {
-                non_ground_msg.colors.push_back(static_cast<float>(color.x()));
-                non_ground_msg.colors.push_back(static_cast<float>(color.y()));
-                non_ground_msg.colors.push_back(static_cast<float>(color.z()));
+            non_ground_msg.points.reserve(non_ground_pcd->points_.size() * 3);
+            for (const auto& point : non_ground_pcd->points_) {
+                non_ground_msg.points.push_back(static_cast<float>(point.x()));
+                non_ground_msg.points.push_back(static_cast<float>(point.y()));
+                non_ground_msg.points.push_back(static_cast<float>(point.z()));
             }
+
+            if (has_colors) {
+                non_ground_msg.colors.reserve(non_ground_pcd->colors_.size() * 3);
+                for (const auto& color : non_ground_pcd->colors_) {
+                    non_ground_msg.colors.push_back(static_cast<float>(color.x()));
+                    non_ground_msg.colors.push_back(static_cast<float>(color.y()));
+                    non_ground_msg.colors.push_back(static_cast<float>(color.z()));
+                }
+            }
+            non_ground_pub_->publish(non_ground_msg);
         }
-        non_ground_pub_->publish(non_ground_msg);
 
         // 耗时统计
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -228,7 +366,7 @@ private:
         RCLCPP_INFO(this->get_logger(),
             "[STAGE-DONE] ground_segmentation: Frame %zu processed | Ground: %zu, Non-Ground: %zu | Time: %.2f ms",
             gs_frame_seq,
-            pcd->points_.size() - non_ground_pcd->points_.size(),
+            ground_pcd->points_.size(),
             non_ground_pcd->points_.size(),
             elapsed_ms);
 
@@ -240,19 +378,19 @@ private:
                                     std::to_string(msg->header.stamp.nanosec);
 
             // 保存重建地面点
-            if (enable_sparse_ground_points_saving_ && sparse_ground_pcd) {
+            if (enable_sparse_ground_points_saving_ && sparse_ground_pcd && !sparse_ground_pcd->points_.empty()) {
                 std::string file_path = data_saved_dir_ + "sparse_gpcd_" + timestamp + ".ply";
                 open3d::io::WritePointCloud(file_path, *sparse_ground_pcd);
             }
 
             // 保存全量地面点
-            if (enable_ground_points_saving_ && ground_pcd) {
+            if (enable_ground_points_saving_ && ground_pcd && !ground_pcd->points_.empty()) {
                 std::string file_path = data_saved_dir_ + "full_gpcd_" + timestamp + ".ply";
                 open3d::io::WritePointCloud(file_path, *ground_pcd);
             }
 
             // 保存无地面点
-            if (enable_non_ground_points_saving_ && non_ground_pcd) {
+            if (enable_non_ground_points_saving_ && non_ground_pcd && !non_ground_pcd->points_.empty()) {
                 std::string file_path = data_saved_dir_ + "nongpcd_" + timestamp + ".ply";
                 open3d::io::WritePointCloud(file_path, *non_ground_pcd);
             }
@@ -262,6 +400,9 @@ private:
     // 算法参数
     double grid_size_;
     double height_threshold_;
+    bool enable_outlier_suppression_;
+    double outlier_z_threshold_;
+    bool enable_slope_interpolation_;
     bool enable_ground_points_saving_;
     bool enable_non_ground_points_saving_;
     bool enable_sparse_ground_points_saving_;

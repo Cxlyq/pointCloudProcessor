@@ -28,6 +28,7 @@
 #include "message_filters/sync_policies/approximate_time.h"
 #include "message_filters/synchronizer.h"
 #include "open3d/Open3D.h"
+#include "../include/reconstruction/terrain_height_grid.hpp"
 #include "pc_msgs/msg/o3_d_mesh.hpp"
 #include "pc_msgs/msg/o3_d_point_cloud.hpp"
 #include "pc_msgs/msg/clustered_point_cloud.hpp"
@@ -107,6 +108,10 @@ public:
         this->declare_parameter<std::string>("sub_cluster_topic", "/clustering/clustered_pointcloud");
         this->declare_parameter<std::string>("pub_mesh_topic", "/reconstruction/white_mesh");
         this->declare_parameter<int>("min_cluster_size", 15);
+        this->declare_parameter<bool>("enable_sub_ground_filter", true);
+        this->declare_parameter<double>("sub_ground_clearance", 0.5);
+        this->declare_parameter<bool>("enable_obb_ground_clamp", true);
+        this->declare_parameter<double>("obb_ground_clearance", 0.1);
         this->declare_parameter<int>("poisson_depth", 8);
         this->declare_parameter<double>("normal_radius", 20.0);
         this->declare_parameter<int>("normal_max_nn", 30);
@@ -149,8 +154,12 @@ public:
         auto sub_c_topic  = this->get_parameter("sub_cluster_topic").as_string();
         auto pub_m_topic  = this->get_parameter("pub_mesh_topic").as_string();
 
-        min_cluster_size_  = this->get_parameter("min_cluster_size").as_int();
-        poisson_depth_     = this->get_parameter("poisson_depth").as_int();
+        min_cluster_size_         = this->get_parameter("min_cluster_size").as_int();
+        enable_sub_ground_filter_ = this->get_parameter("enable_sub_ground_filter").as_bool();
+        sub_ground_clearance_     = this->get_parameter("sub_ground_clearance").as_double();
+        enable_obb_ground_clamp_  = this->get_parameter("enable_obb_ground_clamp").as_bool();
+        obb_ground_clearance_     = this->get_parameter("obb_ground_clearance").as_double();
+        poisson_depth_            = this->get_parameter("poisson_depth").as_int();
         normal_radius_     = this->get_parameter("normal_radius").as_double();
         normal_max_nn_     = this->get_parameter("normal_max_nn").as_int();
         density_quantile_  = this->get_parameter("density_quantile").as_double();
@@ -252,11 +261,14 @@ public:
             "    Cluster topic: %s\n"
             "    Plane state  : %s\n"
             "    Tower service: %s (radius=%.1f km)\n"
-            "    Sync slop    : %.3f s",
+            "    Sync slop    : %.3f s\n"
+            "    Sub-ground filter: %s (clearance=%.2f m), OBB clamp: %s (clearance=%.2f m)",
             sub_g_topic.c_str(), sub_c_topic.c_str(),
             sub_plane_state_topic_.c_str(),
             tower_query_service_.c_str(), tower_query_radius_km_,
-            sync_slop_sec_);
+            sync_slop_sec_,
+            enable_sub_ground_filter_ ? "true" : "false", sub_ground_clearance_,
+            enable_obb_ground_clamp_ ? "true" : "false", obb_ground_clearance_);
     }
 
 private:
@@ -397,6 +409,12 @@ private:
             }
         }
 
+        // 构建 2D 空间网格地面高程索引（供地下点过滤、OBB 防穿模及高压塔高程估计复用）
+        reconstruction::TerrainHeightGrid terrain_grid;
+        if (final_terrain_mesh) {
+            terrain_grid.build(final_terrain_mesh);
+        }
+
         // ─── 阶段 2：非地面聚类 OBB 重建 ──────────────────────────────────
         if (cluster_points_count > 0) {
             auto cluster_pcd_full = std::make_shared<open3d::geometry::PointCloud>();
@@ -416,10 +434,26 @@ private:
                 }
                 if (indices.size() < static_cast<size_t>(min_cluster_size_)) continue;
 
+                // 利用泊松地面白模滤除地面以下点与贴地碎点
+                if (enable_sub_ground_filter_ && terrain_grid.valid()) {
+                    indices = reconstruction::filter_cluster_above_terrain(
+                        *cluster_pcd_full, indices, terrain_grid, sub_ground_clearance_);
+                    if (indices.size() < static_cast<size_t>(min_cluster_size_)) continue;
+                }
+
                 auto cluster_pcd = cluster_pcd_full->SelectByIndex(indices);
                 try {
                     auto obb      = cluster_pcd->GetOrientedBoundingBox();
                     auto obb_mesh = open3d::geometry::TriangleMesh::CreateFromOrientedBoundingBox(obb);
+
+                    // 对 OBB 顶点与三角面中心做地面高程防穿模抬升约束
+                    if (enable_obb_ground_clamp_ && terrain_grid.valid()) {
+                        if (!reconstruction::clamp_obb_mesh_above_terrain(
+                                *obb_mesh, terrain_grid, obb_ground_clearance_)) {
+                            continue;
+                        }
+                    }
+
                     obb_mesh->ComputeVertexNormals();
                     obb_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
                     *architecture_mesh += *obb_mesh;
@@ -432,7 +466,7 @@ private:
         }
 
         // ─── 阶段 3：高压塔白模插入（使用与本帧同步的载机状态）──────────
-        insert_power_towers(combined_mesh, plane_state_msg, final_terrain_mesh, ground_pcd);
+        insert_power_towers(combined_mesh, plane_state_msg, terrain_grid, ground_pcd);
 
         // ─── 阶段 4：本地文件保存 ─────────────────────────────────────────
         if (!data_saved_dir_.empty()) {
@@ -507,113 +541,18 @@ private:
     }
 
     // ── 从地面模型获取指定 (target_x, target_y) 处的地面高度 ─────────────
-    // 若 target 位于地面三角网格内，返回重心插值高度；
-    // 若在 max_dist 阈值范围内，返回反距离加权高度；
+    // 若存在泊松地面网格索引，直接通过 TerrainHeightGrid 快速查询；
+    // 若地面网格为空，回退检查地面点云；
     // 若超出地面模型依托范围（如在视场后方或盲区），返回 std::nullopt
     std::optional<double> get_ground_height_at(
         double target_x, double target_y,
-        const std::shared_ptr<open3d::geometry::TriangleMesh>& terrain_mesh,
+        const reconstruction::TerrainHeightGrid& terrain_grid,
         const std::shared_ptr<open3d::geometry::PointCloud>& ground_pcd,
         double max_dist_threshold) const
     {
-        // 1. 若有重建出的地面网格，优先进行 2D 三角形包含判定与重心坐标插值
-        if (terrain_mesh && !terrain_mesh->vertices_.empty() && !terrain_mesh->triangles_.empty()) {
-            const auto& vertices = terrain_mesh->vertices_;
-            const auto& triangles = terrain_mesh->triangles_;
-
-            // 1.1 先做整体 2D 边界盒（AABB）粗筛：若远在地面网格外，直接判定无地面依托
-            double g_min_x = std::numeric_limits<double>::infinity();
-            double g_max_x = -std::numeric_limits<double>::infinity();
-            double g_min_y = std::numeric_limits<double>::infinity();
-            double g_max_y = -std::numeric_limits<double>::infinity();
-
-            for (const auto& v : vertices) {
-                if (v.x() < g_min_x) g_min_x = v.x();
-                if (v.x() > g_max_x) g_max_x = v.x();
-                if (v.y() < g_min_y) g_min_y = v.y();
-                if (v.y() > g_max_y) g_max_y = v.y();
-            }
-
-            if (target_x < g_min_x - max_dist_threshold || target_x > g_max_x + max_dist_threshold ||
-                target_y < g_min_y - max_dist_threshold || target_y > g_max_y + max_dist_threshold) {
-                // 超出地面网格整体包围盒容差范围（例如在无人机视角后方），无地面依托
-                return std::nullopt;
-            }
-
-            // 1.2 遍历三角面片进行精确包含测试
-            for (const auto& tri : triangles) {
-                const auto& A = vertices[static_cast<size_t>(tri.x())];
-                const auto& B = vertices[static_cast<size_t>(tri.y())];
-                const auto& C = vertices[static_cast<size_t>(tri.z())];
-
-                double min_x = std::min({A.x(), B.x(), C.x()});
-                double max_x = std::max({A.x(), B.x(), C.x()});
-                double min_y = std::min({A.y(), B.y(), C.y()});
-                double max_y = std::max({A.y(), B.y(), C.y()});
-
-                if (target_x < min_x - 1e-3 || target_x > max_x + 1e-3 ||
-                    target_y < min_y - 1e-3 || target_y > max_y + 1e-3) {
-                    continue;
-                }
-
-                double denom = (B.y() - C.y()) * (A.x() - C.x()) + (C.x() - B.x()) * (A.y() - C.y());
-                if (std::abs(denom) > 1e-9) {
-                    double wA = ((B.y() - C.y()) * (target_x - C.x()) + (C.x() - B.x()) * (target_y - C.y())) / denom;
-                    double wB = ((C.y() - A.y()) * (target_x - C.x()) + (A.x() - C.x()) * (target_y - C.y())) / denom;
-                    double wC = 1.0 - wA - wB;
-
-                    if (wA >= -1e-4 && wB >= -1e-4 && wC >= -1e-4) {
-                        return wA * A.z() + wB * B.z() + wC * C.z();
-                    }
-                }
-            }
-
-            // 1.3 若未严格落入三角面片内部，在 max_dist_threshold 容差范围内搜索最近顶点
-            const double max_dist_sq = max_dist_threshold * max_dist_threshold;
-            struct Neighbor {
-                double dist_sq;
-                double z;
-            };
-            std::vector<Neighbor> nearest;
-            nearest.reserve(4);
-
-            for (const auto& v : vertices) {
-                double dx = v.x() - target_x;
-                double dy = v.y() - target_y;
-                double d2 = dx * dx + dy * dy;
-                if (d2 > max_dist_sq) continue;
-
-                if (nearest.size() < 4) {
-                    nearest.push_back({d2, v.z()});
-                    if (nearest.size() == 4) {
-                        std::sort(nearest.begin(), nearest.end(), [](const Neighbor& a, const Neighbor& b) {
-                            return a.dist_sq < b.dist_sq;
-                        });
-                    }
-                } else if (d2 < nearest.back().dist_sq) {
-                    nearest.back() = {d2, v.z()};
-                    std::sort(nearest.begin(), nearest.end(), [](const Neighbor& a, const Neighbor& b) {
-                        return a.dist_sq < b.dist_sq;
-                    });
-                }
-            }
-
-            if (!nearest.empty()) {
-                if (nearest.front().dist_sq < 1e-4) {
-                    return nearest.front().z;
-                }
-                double weight_sum = 0.0;
-                double z_weighted = 0.0;
-                for (const auto& nb : nearest) {
-                    double w = 1.0 / (nb.dist_sq + 1e-6);
-                    weight_sum += w;
-                    z_weighted += w * nb.z;
-                }
-                return z_weighted / weight_sum;
-            }
-
-            // 最近顶点距离仍超过容差阈值，判定为无地面依托
-            return std::nullopt;
+        // 1. 优先通过 2D 网格加速索引查询泊松地面三角网格
+        if (terrain_grid.valid()) {
+            return terrain_grid.get_height(target_x, target_y, max_dist_threshold);
         }
 
         // 2. 若地面网格为空，回退检查地面点云
@@ -645,7 +584,7 @@ private:
     void insert_power_towers(
         std::shared_ptr<open3d::geometry::TriangleMesh>& combined_mesh,
         const pc_msgs::msg::PlaneState::ConstSharedPtr& plane_state,
-        const std::shared_ptr<open3d::geometry::TriangleMesh>& terrain_mesh,
+        const reconstruction::TerrainHeightGrid& terrain_grid,
         const std::shared_ptr<open3d::geometry::PointCloud>& ground_pcd)
     {
         if (!tower_model_loaded_ || !tower_mesh_) {
@@ -703,7 +642,7 @@ private:
             if (use_estimated_powertower_z_) {
                 // 当前 srv 提供的高度信息无效，从地面模型获取高压塔所在位置的地面高度
                 auto ground_z = get_ground_height_at(
-                    enu.x(), enu.y(), terrain_mesh, ground_pcd, tower_ground_search_radius_);
+                    enu.x(), enu.y(), terrain_grid, ground_pcd, tower_ground_search_radius_);
                 if (!ground_z.has_value()) {
                     // 无地面依托（如位于无人机视角后方或激光雷达地面扫描范围外），跳过不显示
                     continue;
@@ -728,6 +667,10 @@ private:
 
     // ── 参数（继承自 obb 节点）────────────────────────────────────────────
     int    min_cluster_size_;
+    bool   enable_sub_ground_filter_;
+    double sub_ground_clearance_;
+    bool   enable_obb_ground_clamp_;
+    double obb_ground_clearance_;
     int    poisson_depth_;
     double normal_radius_;
     int    normal_max_nn_;

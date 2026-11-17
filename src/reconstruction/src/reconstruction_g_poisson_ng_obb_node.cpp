@@ -22,6 +22,7 @@
 #include "pc_msgs/msg/o3_d_mesh.hpp"
 
 #include "open3d/Open3D.h"
+#include "../include/reconstruction/terrain_height_grid.hpp"
 #include <Eigen/Core>
 
 using std::placeholders::_1;
@@ -42,6 +43,10 @@ public:
 
         // 聚类重建参数
         this->declare_parameter<int>("min_cluster_size", 15);
+        this->declare_parameter<bool>("enable_sub_ground_filter", true);
+        this->declare_parameter<double>("sub_ground_clearance", 0.5);
+        this->declare_parameter<bool>("enable_obb_ground_clamp", true);
+        this->declare_parameter<double>("obb_ground_clearance", 0.1);
 
         // 泊松重建(地面)特有参数
         this->declare_parameter<int>("poisson_depth", 8);
@@ -60,6 +65,10 @@ public:
         auto pub_m_topic = this->get_parameter("pub_mesh_topic").as_string();
 
         min_cluster_size_ = this->get_parameter("min_cluster_size").as_int();
+        enable_sub_ground_filter_ = this->get_parameter("enable_sub_ground_filter").as_bool();
+        sub_ground_clearance_ = this->get_parameter("sub_ground_clearance").as_double();
+        enable_obb_ground_clamp_ = this->get_parameter("enable_obb_ground_clamp").as_bool();
+        obb_ground_clearance_ = this->get_parameter("obb_ground_clearance").as_double();
         poisson_depth_ = this->get_parameter("poisson_depth").as_int();
         normal_radius_ = this->get_parameter("normal_radius").as_double();
         normal_max_nn_ = this->get_parameter("normal_max_nn").as_int();
@@ -99,7 +108,11 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "[*] Hybrid Reconstruction node brought up. Listening on: 1. %s  2. %s...",
                     sub_g_topic.c_str(), sub_c_topic.c_str());
-        RCLCPP_INFO(this->get_logger(), "    - Poisson Depth: %d, Density Quantile: %.2f", poisson_depth_, density_quantile_);
+        RCLCPP_INFO(this->get_logger(),
+                    "    - Poisson Depth: %d, Density Quantile: %.2f, Sub-ground filter: %s (%.2f m), OBB clamp: %s (%.2f m)",
+                    poisson_depth_, density_quantile_,
+                    enable_sub_ground_filter_ ? "true" : "false", sub_ground_clearance_,
+                    enable_obb_ground_clamp_ ? "true" : "false", obb_ground_clearance_);
     }
 
 private:
@@ -191,6 +204,12 @@ private:
             }
         }
 
+        // 构建 2D 空间网格地面高程索引（供地下点过滤与 OBB 防穿模复用）
+        reconstruction::TerrainHeightGrid terrain_grid;
+        if (final_terrain_mesh) {
+            terrain_grid.build(final_terrain_mesh);
+        }
+
         // =========================================================
         // 阶段 2: 非地面聚类块 OBB 重建
         // =========================================================
@@ -222,12 +241,29 @@ private:
                     continue;
                 }
 
+                // 利用泊松地面白模滤除地面以下点与贴地碎点
+                if (enable_sub_ground_filter_ && terrain_grid.valid()) {
+                    cluster_indices = reconstruction::filter_cluster_above_terrain(
+                        *cluster_pcd_full, cluster_indices, terrain_grid, sub_ground_clearance_);
+                    if (cluster_indices.size() < static_cast<size_t>(min_cluster_size_)) {
+                        continue;
+                    }
+                }
+
                 auto cluster_pcd = cluster_pcd_full->SelectByIndex(cluster_indices);
 
                 // 使用 OBB 重建
                 try {
                     auto obb = cluster_pcd->GetOrientedBoundingBox();
                     auto obb_mesh = open3d::geometry::TriangleMesh::CreateFromOrientedBoundingBox(obb);
+
+                    // 对 OBB 顶点与三角面中心做地面高程防穿模抬升约束
+                    if (enable_obb_ground_clamp_ && terrain_grid.valid()) {
+                        if (!reconstruction::clamp_obb_mesh_above_terrain(
+                                *obb_mesh, terrain_grid, obb_ground_clearance_)) {
+                            continue;
+                        }
+                    }
 
                     obb_mesh->ComputeVertexNormals();
                     obb_mesh->PaintUniformColor(Eigen::Vector3d(0.9, 0.9, 0.9));
@@ -329,6 +365,10 @@ private:
 
     // 参数
     int min_cluster_size_;
+    bool enable_sub_ground_filter_;
+    double sub_ground_clearance_;
+    bool enable_obb_ground_clamp_;
+    double obb_ground_clearance_;
     int poisson_depth_;
     double normal_radius_;
     int normal_max_nn_;

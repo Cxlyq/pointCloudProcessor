@@ -45,6 +45,11 @@ reconstruction_g_poisson_ng_obb_node:
     pub_mesh_topic: "/reconstruction/white_mesh"
     # 聚类非地面物体的过滤阈值
     min_cluster_size: 15
+    # 地面以下点过滤与 OBB 防穿模参数
+    enable_sub_ground_filter: true
+    sub_ground_clearance: 0.5
+    enable_obb_ground_clamp: true
+    obb_ground_clearance: 0.1
     # 泊松重建（地面）特有参数
     poisson_depth: 6
     density_quantile: 0.06
@@ -65,6 +70,11 @@ reconstruction_g_poisson_ng_obb_pt_node:
     pub_mesh_topic: "/reconstruction/white_mesh"
     # 重建参数（同 obb 节点）
     min_cluster_size: 15
+    # 地面以下点过滤与 OBB 防穿模参数
+    enable_sub_ground_filter: true
+    sub_ground_clearance: 0.5
+    enable_obb_ground_clamp: true
+    obb_ground_clearance: 0.1
     poisson_depth: 6
     density_quantile: 0.06
     normal_radius: 20.0
@@ -73,7 +83,7 @@ reconstruction_g_poisson_ng_obb_pt_node:
     data_saved_dir: "/home/asahichinn/Documents/codes/pointCloudProcessor/dataset/result/Wild/04"
     enable_terrain_mesh_saving: false
     enable_architecture_mesh_saving: false
-    enable_combined_mesh_saving: false
+    enable_combined_mesh_saving: true
     # 载机状态 topic（来自 sim_plane_data_flow_node）
     # 与 io_handlers/config/io_config.yaml 中 plane_state_topic 保持一致
     sub_plane_state_topic: "/io/plane/state"

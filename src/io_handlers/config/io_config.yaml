@@ -23,6 +23,6 @@ sim_plane_data_flow_node:
     # 坐标系 frame_id
     frame_id: "map"
     # 是否循环发布（false = 发完即停）
-    is_loop: true
+    is_loop: false
     # 默认查询半径（千米），请求中 radius_km <= 0 时使用此值
     default_query_radius_km: 5.0
