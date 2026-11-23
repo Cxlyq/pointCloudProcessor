@@ -1,3 +1,5 @@
+#include <map>
+#include <pc_msgs/msg/plane_state.hpp>
 // =============================================================================
 // flow_alignment_node : 白膜帧间配准 ROS 2 节点（正式嵌入版）
 // -----------------------------------------------------------------------------
@@ -253,7 +255,12 @@ public:
             .durability_volatile();
         sub_mesh_ = this->create_subscription<pc_msgs::msg::O3DMesh>(
             sub_mesh_topic_, qos,
-            std::bind(&FlowAlignmentNode::mesh_callback, this, std::placeholders::_1));
+            [this](pc_msgs::msg::O3DMesh::SharedPtr msg) {
+                if (use_gps_init_) queue_mesh(msg);
+                else mesh_callback(msg);
+            });
+
+        if (use_gps_init_) subscribe_navigation();
 
         RCLCPP_INFO(this->get_logger(),
                     "[*] FlowAlignmentNode up. sub=%s pub_mesh=%s pub_pc=%s pub_stats=%s",
@@ -266,6 +273,76 @@ public:
     }
 
 private:
+
+    // Pair by the acquisition stamp, never by callback arrival order.
+    using Nav = pc_msgs::msg::PlaneState;
+    using MeshMessage = pc_msgs::msg::O3DMesh;
+    std::map<int64_t, Nav::ConstSharedPtr> nav_pending_;
+    std::map<int64_t, MeshMessage::SharedPtr> mesh_pending_;
+    rclcpp::Subscription<Nav>::SharedPtr nav_sub_;
+    Nav::ConstSharedPtr nav_origin_;
+    Eigen::Matrix4d current_nav_ = Eigen::Matrix4d::Identity();
+    static int64_t stamp_key(const std_msgs::msg::Header& h) {
+        return int64_t(h.stamp.sec)*1000000000LL+h.stamp.nanosec;
+    }
+    void pair_messages() {
+        while (!mesh_pending_.empty()) {
+            auto mesh = mesh_pending_.begin();
+            auto state = nav_pending_.find(mesh->first);
+            if (state == nav_pending_.end()) break;
+            const auto& n = *state->second;
+            if (!nav_origin_) nav_origin_ = state->second;
+            const auto& o = *nav_origin_;
+            const double c = o.course*M_PI/180.;
+            const double e = (n.longitude-o.longitude)*111320.*std::cos(o.latitude*M_PI/180.);
+            const double north = (n.latitude-o.latitude)*111320.;
+            // Local scan -> first scan's navigation reference frame.
+            current_nav_.setIdentity();
+            current_nav_.block<3,3>(0,0) =
+                Eigen::AngleAxisd(c-n.course*M_PI/180., Eigen::Vector3d::UnitZ()).toRotationMatrix();
+            current_nav_.block<3,1>(0,3) << std::cos(c)*e-std::sin(c)*north,
+                std::sin(c)*e+std::cos(c)*north, n.altitude-o.altitude;
+            auto message = mesh->second;
+            mesh_pending_.erase(mesh);
+            nav_pending_.erase(state);
+            mesh_callback(message);
+        }
+    }
+    void subscribe_navigation() {
+        const auto topic = this->declare_parameter<std::string>("plane_state_topic", "/io/plane/state");
+        nav_sub_ = this->create_subscription<Nav>(topic, 32, [this](Nav::ConstSharedPtr nav) {
+            nav_pending_[stamp_key(nav->header)] = nav;
+            if (nav_pending_.size() > 32) nav_pending_.erase(nav_pending_.begin());
+            pair_messages();
+        });
+    }
+    void queue_mesh(MeshMessage::SharedPtr mesh) {
+        mesh_pending_[stamp_key(mesh->header)] = mesh;
+        if (mesh_pending_.size() > 8) {
+            RCLCPP_WARN(this->get_logger(), "No matching PlaneState stamp for oldest mesh");
+            mesh_pending_.erase(mesh_pending_.begin());
+        }
+        pair_messages();
+    }
+
+    Eigen::Vector3d correction_ = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond rotation_ = Eigen::Quaterniond::Identity();
+
+    // The offline matcher gates the rigid candidate, then updates its correction by 20%.
+    Eigen::Matrix4d accept_candidate(const IcpResult& result) {
+        if (result.T.allFinite() && result.fitness >= .35 && result.inlier_rmse <= 50.) {
+            const Eigen::Vector3d shift = result.T.block<3,1>(0,3)-current_nav_.block<3,1>(0,3);
+            const Eigen::Matrix3d turn = result.T.block<3,3>(0,0)*current_nav_.block<3,3>(0,0).transpose();
+            if (shift.norm() <= 35. && Eigen::AngleAxisd(turn).angle()*180./M_PI <= 5.) {
+                correction_ = .8*correction_+.2*shift;
+                rotation_ = rotation_.slerp(.2, Eigen::Quaterniond(turn)).normalized();
+            }
+        }
+        Eigen::Matrix4d pose = current_nav_;
+        pose.block<3,1>(0,3) += correction_;
+        pose.block<3,3>(0,0) = rotation_.toRotationMatrix()*current_nav_.block<3,3>(0,0);
+        return pose;
+    }
     void mesh_callback(const pc_msgs::msg::O3DMesh::ConstSharedPtr& msg) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -328,23 +405,23 @@ private:
         std::shared_ptr<geometry::PointCloud> map;
         if (window_.empty()) {
             // 首帧：锚定世界系
-            res.T = Eigen::Matrix4d::Identity();
-            src_w = std::make_shared<geometry::PointCloud>(*src);
+            res.T = use_gps_init_ ? current_nav_ : Eigen::Matrix4d::Identity();
+            src_w = TransformPcd(src, res.T);
             RCLCPP_INFO(this->get_logger(), "  [reg] frame=%zu anchor (identity)", frame_seq_);
         } else {
             map = MergeWindow(window_, icp_voxel_);
             Eigen::Matrix4d T0 = Eigen::Matrix4d::Identity();
             if (use_gps_init_) {
-                // white_mesh 消息不含 GPS；真机若需 GPS 初值，需另行注入。
-                // 此处退化 Identity 并提示一次。
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                     "[i] use_gps_init=true but mesh msg has no GPS; fallback identity");
+                T0 = current_nav_;
+                T0.block<3,1>(0,3) += correction_;
+                T0.block<3,3>(0,0) = rotation_.toRotationMatrix()*current_nav_.block<3,3>(0,0);
             }
             double r = EstimateResolution(src, map);
             auto t0 = std::chrono::high_resolution_clock::now();
             res = TrimmedPointToPlaneICP(src, map, T0, r, alpha_, icp_max_iter_, icp_normal_angle_);
             auto t1 = std::chrono::high_resolution_clock::now();
             double icp_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (use_gps_init_) res.T = accept_candidate(res);
             src_w = TransformPcd(src, res.T);
             Eigen::Matrix3d R = res.T.block<3, 3>(0, 0);
             double rot_deg = std::acos(std::max(-1.0, std::min(1.0, (R.trace() - 1.0) / 2.0)))
@@ -367,7 +444,8 @@ private:
         aligned->Transform(res.T);
         // 法线旋转（刚性，保持与几何一致；不重算避免朝向翻转）
         Eigen::Matrix3d R3 = res.T.block<3, 3>(0, 0);
-        for (auto& n : aligned->vertex_normals_) n = R3 * n;
+        // Open3D Transform already rotates normals in the offline branch.
+        if (!use_gps_init_) for (auto& n : aligned->vertex_normals_) n = R3 * n;
         publish_aligned_mesh(aligned, msg->header);
 
         // 6) 发布窗口 map 点云（可选）

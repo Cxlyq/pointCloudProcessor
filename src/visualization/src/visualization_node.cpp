@@ -1,3 +1,7 @@
+#include <map>
+#include <pc_msgs/msg/plane_state.hpp>
+#include <deque>
+#include "offline_terrain_display.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -215,6 +219,14 @@ struct CamConfig {
 class VisualizationNode : public rclcpp::Node {
 public:
     VisualizationNode() : Node("visualization_node"), new_mesh_available_(false) {
+        offline_display_ = this->declare_parameter<bool>("offline_terrain_display", false);
+        if (offline_display_) {
+            const auto topic = this->declare_parameter<std::string>("subscribe_topic", "/flow/aligned_mesh");
+            subscribe_navigation();
+            subscription_ = this->create_subscription<MeshMessage>(topic, 10,
+                [this](MeshMessage::SharedPtr mesh) { queue_mesh(mesh); });
+            return;
+        }
         // 1. 声明节点的基础话题和相机列表
         this->declare_parameter<std::string>("subscribe_topic", "/reconstruction/white_mesh");
         this->declare_parameter<std::vector<std::string>>("camera_ids", {"cam_front"});
@@ -594,6 +606,7 @@ public:
 
     // 维持 UI 心跳的主循环函数
     void update_ui() {
+        if (offline_display_) { update_offline_display(); return; }
         std::shared_ptr<open3d::geometry::TriangleMesh> mesh_to_render = nullptr;
         std::chrono::steady_clock::time_point mesh_received_at;
         std::optional<std::chrono::nanoseconds>
@@ -1442,6 +1455,110 @@ private:
         InitializeFpsWindow(window, received_at);
     }
 
+
+    // Pair by the acquisition stamp, never by callback arrival order.
+    using Nav = pc_msgs::msg::PlaneState;
+    using MeshMessage = pc_msgs::msg::O3DMesh;
+    std::map<int64_t, Nav::ConstSharedPtr> nav_pending_;
+    std::map<int64_t, MeshMessage::SharedPtr> mesh_pending_;
+    rclcpp::Subscription<Nav>::SharedPtr nav_sub_;
+    Nav::ConstSharedPtr nav_origin_;
+    Eigen::Matrix4d current_nav_ = Eigen::Matrix4d::Identity();
+    static int64_t stamp_key(const std_msgs::msg::Header& h) {
+        return int64_t(h.stamp.sec)*1000000000LL+h.stamp.nanosec;
+    }
+    void pair_messages() {
+        while (!mesh_pending_.empty()) {
+            auto mesh = mesh_pending_.begin();
+            auto state = nav_pending_.find(mesh->first);
+            if (state == nav_pending_.end()) break;
+            const auto& n = *state->second;
+            if (!nav_origin_) nav_origin_ = state->second;
+            const auto& o = *nav_origin_;
+            const double c = o.course*M_PI/180.;
+            const double e = (n.longitude-o.longitude)*111320.*std::cos(o.latitude*M_PI/180.);
+            const double north = (n.latitude-o.latitude)*111320.;
+            // Local scan -> first scan's navigation reference frame.
+            current_nav_.setIdentity();
+            current_nav_.block<3,3>(0,0) =
+                Eigen::AngleAxisd(c-n.course*M_PI/180., Eigen::Vector3d::UnitZ()).toRotationMatrix();
+            current_nav_.block<3,1>(0,3) << std::cos(c)*e-std::sin(c)*north,
+                std::sin(c)*e+std::cos(c)*north, n.altitude-o.altitude;
+            auto message = mesh->second;
+            mesh_pending_.erase(mesh);
+            nav_pending_.erase(state);
+            mesh_callback(message);
+        }
+    }
+    void subscribe_navigation() {
+        const auto topic = this->declare_parameter<std::string>("plane_state_topic", "/io/plane/state");
+        nav_sub_ = this->create_subscription<Nav>(topic, 32, [this](Nav::ConstSharedPtr nav) {
+            nav_pending_[stamp_key(nav->header)] = nav;
+            if (nav_pending_.size() > 32) nav_pending_.erase(nav_pending_.begin());
+            pair_messages();
+        });
+    }
+    void queue_mesh(MeshMessage::SharedPtr mesh) {
+        mesh_pending_[stamp_key(mesh->header)] = mesh;
+        if (mesh_pending_.size() > 8) {
+            RCLCPP_WARN(this->get_logger(), "No matching PlaneState stamp for oldest mesh");
+            mesh_pending_.erase(mesh_pending_.begin());
+        }
+        pair_messages();
+    }
+
+    bool offline_display_ = false;
+    std::deque<offline_terrain::SceneFrame> offline_frames_;
+    offline_terrain::Coverage offline_coverage_;
+    std::optional<offline_terrain::SceneFrame> offline_previous_, offline_next_;
+    std::optional<offline_terrain::Segment> offline_segment_;
+    Eigen::Vector2d offline_heading_{0., 1.};
+    unsigned offline_step_ = 0;
+    std::chrono::steady_clock::time_point offline_due_{};
+    pointcloud_visualization::NativeFrameWindow offline_window_;
+
+    // The main thread owns the window and plays each adjacent pair over 60 steps.
+    void update_offline_display() {
+        if (!offline_window_.IsOpen() && !offline_window_.Create("Terrain", 800, 600)) {
+            RCLCPP_ERROR(this->get_logger(), "%s", offline_window_.LastError().c_str());
+            rclcpp::shutdown();
+            return;
+        }
+        offline_window_.PollEvents();
+        if (!offline_window_.IsOpen()) { rclcpp::shutdown(); return; }
+        auto take_frame = [this]() -> std::optional<offline_terrain::SceneFrame> {
+            offline_terrain::SceneFrame frame;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (offline_frames_.empty()) return std::nullopt;
+                frame = std::move(offline_frames_.front());
+                offline_frames_.pop_front();
+            }
+            frame.cumulative = offline_coverage_.append(frame.update, Eigen::Matrix4d::Identity());
+            return frame;
+        };
+        if (!offline_previous_) offline_previous_ = take_frame();
+        if (!offline_previous_) return;
+        if (!offline_next_) {
+            offline_next_ = take_frame();
+            if (!offline_next_) return;
+            offline_segment_.emplace(*offline_previous_, *offline_next_, offline_heading_, offline_step_ == 0);
+            offline_due_ = std::chrono::steady_clock::now();
+        }
+        if (std::chrono::steady_clock::now() < offline_due_) return;
+        auto image = offline_segment_->draw(*offline_previous_, *offline_next_, offline_step_/60.);
+        cv::Mat rgb(600, 800, CV_8UC3, image.data_.data()), bgr;
+        cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+        offline_window_.Present(bgr);
+        offline_due_ += std::chrono::microseconds(33333);
+        if (++offline_step_ > 60) {
+            offline_heading_ = offline_segment_->desired;
+            offline_previous_ = std::move(offline_next_);
+            offline_next_.reset();
+            offline_step_ = 1; // The common endpoint was already shown.
+        }
+    }
+
     void mesh_callback(const pc_msgs::msg::O3DMesh::SharedPtr msg) {
         const auto mesh_received_at =
             std::chrono::steady_clock::now();
@@ -1558,6 +1675,12 @@ private:
             }
         }
 
+        if (offline_display_) {
+            // Aligned mesh is already in world coordinates. Navigation drives only the camera.
+            std::lock_guard<std::mutex> lock(mutex_);
+            offline_frames_.push_back({current_nav_, mesh, {}});
+            return;
+        }
         // 5. 线程安全的数据投递
         bool superseded_previous_mesh = false;
         {

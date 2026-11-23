@@ -13,7 +13,8 @@ flow_alignment_node:
     alpha: 0.7
     icp_max_iter_per_level: 40
     icp_normal_angle_deg: 60.0
-    use_gps_init: false          # white_mesh 无 GPS 字段；真机如需 GPS 初值另行注入
+    use_gps_init: true           # 离线配准模式，按采集时间戳匹配白膜和导航
+    plane_state_topic: /io/plane/state
     align_scale: 1.0
     normal_radius: 20.0          # mesh 无法线时的兜底法线估计参数
     normal_max_nn: 15

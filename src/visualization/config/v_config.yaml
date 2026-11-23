@@ -1,5 +1,7 @@
 visualization_node:
   ros__parameters:
+    offline_terrain_display: true  # 使用离线 GPS 相机、累计覆盖和远景渐变
+    plane_state_topic: /io/plane/state
     subscribe_topic: "/flow/aligned_mesh"
     fps_logging_enabled: true
     fps_logging_interval_sec: 5.0
