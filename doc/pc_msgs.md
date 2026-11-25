@@ -22,9 +22,9 @@
 
 ## 2. 消息定义规范 (Messages)
 
-所有消息接口均位于 [`src/pc_msgs/msg/`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/) 目录。
+所有消息接口均位于 [`src/pc_msgs/msg/`](../src/pc_msgs/msg/) 目录。
 
-### 2.1 [O3DPointCloud.msg](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) —— 核心点云数据包
+### 2.1 [O3DPointCloud.msg](../src/pc_msgs/msg/O3DPointCloud.msg) —— 核心点云数据包
 
 用于传输原始雷达点云、地面滤波后分离出的地面点云与非地面点云。
 
@@ -39,7 +39,7 @@ float32[] colors
   * `points`：一维浮点数组，按 `[x0, y0, z0, x1, y1, z1, ...]` 格式展平存储 $N$ 个三维坐标，数组长度为 $3N$。
   * `colors`：一维浮点数组，可选字段；按 `[r0, g0, b0, r1, g1, b1, ...]` 展平存储各点 RGB 归一化颜色（范围 $[0.0, 1.0]$），长度为 $3N$。若数据源无色彩信息则可为空。
 
-### 2.2 [ClusteredPointCloud.msg](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/ClusteredPointCloud.msg) —— 聚类带标签点云包
+### 2.2 [ClusteredPointCloud.msg](../src/pc_msgs/msg/ClusteredPointCloud.msg) —— 聚类带标签点云包
 
 由 `clustering` 模块处理后输出，为每个非地面点绑定聚类簇编号。
 
@@ -56,7 +56,7 @@ int32 max_label
   * `labels`：长度为 $N$ 的一维整型数组。`labels[i]` 对应第 $i$ 个点所属的类别编号；其中数值 $\ge 0$ 表示有效簇类别（$0, 1, 2, \dots$），数值为 `-1` 表示离群噪声点或被尺寸阈值过滤的背景杂点。
   * `max_label`：当前帧中最大的有效聚类标签值。若未检测到有效聚类簇或全部为噪声，则为 `-1`；若为非负值，则有效聚类总数为 `max_label + 1`。
 
-### 2.3 [O3DMesh.msg](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DMesh.msg) —— 三角网格与白模数据包
+### 2.3 [O3DMesh.msg](../src/pc_msgs/msg/O3DMesh.msg) —— 三角网格与白模数据包
 
 用于传递白模重建结果、帧间流式配准对齐后网格以及末端渲染显示。
 
@@ -75,7 +75,7 @@ float32[] vertex_colors
   * `vertex_normals`：顶点法向量数组，按 `[nx0, ny0, nz0, ...]` 展开，长度为 $3V$。用于光照渲染与点到面 ICP 配准；若缺失可在算法内部兜底估计。
   * `vertex_colors`：顶点颜色数组，按 `[r0, g0, b0, ...]` 展开，范围 $[0.0, 1.0]$，长度为 $3V$。
 
-### 2.4 [PlaneState.msg](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/PlaneState.msg) —— 载机高精度位姿状态包
+### 2.4 [PlaneState.msg](../src/pc_msgs/msg/PlaneState.msg) —— 载机高精度位姿状态包
 
 提供巡检飞机/无人机实时 GPS 导航坐标与航向。
 
@@ -94,7 +94,7 @@ float64 course     # 航向角 (度, 以正北为0，顺时针为正)
   * `altitude`：椭球高度/海拔高度（米）。
   * `course`：机头真航向方位角（$[0^\circ, 360^\circ)$）。
 
-### 2.5 [PowerTowerGPS.msg](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/PowerTowerGPS.msg) —— 高压铁塔全量/批量 GPS 消息
+### 2.5 [PowerTowerGPS.msg](../src/pc_msgs/msg/PowerTowerGPS.msg) —— 高压铁塔全量/批量 GPS 消息
 
 ```protobuf
 std_msgs/Header header
@@ -110,9 +110,9 @@ float64[] altitudes   # 高度数组 (米)，索引 i 对应第 i 座高压塔�
 
 ## 3. 服务定义规范 (Services)
 
-位于 [`src/pc_msgs/srv/`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/srv/) 目录。
+位于 [`src/pc_msgs/srv/`](../src/pc_msgs/srv/) 目录。
 
-### 3.1 [QueryNearbyTowers.srv](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/srv/QueryNearbyTowers.srv) —— 周边高压塔范围检索服务
+### 3.1 [QueryNearbyTowers.srv](../src/pc_msgs/srv/QueryNearbyTowers.srv) —— 周边高压塔范围检索服务
 
 用于下游白模重建或场景融合节点主动根据当前载机位置拉取周围高压铁塔，动态插入真实 CAD 几何模型。
 

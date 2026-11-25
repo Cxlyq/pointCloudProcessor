@@ -10,7 +10,7 @@
 | :--- | :--- |
 | **功能包名称** | `connection_test` |
 | **可执行文件** | 1. `mesh_publisher`<br>2. `mesh_subscriber` |
-| **主 C++ 类** | 1. `MeshPublisher` ([mesh_publisher.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/connection_test/src/mesh_publisher.cpp))<br>2. `MeshSubscriber` ([mesh_subscriber.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/connection_test/src/mesh_subscriber.cpp)) |
+| **主 C++ 类** | 1. `MeshPublisher` ([mesh_publisher.cpp](../src/connection_test/src/mesh_publisher.cpp))<br>2. `MeshSubscriber` ([mesh_subscriber.cpp](../src/connection_test/src/mesh_subscriber.cpp)) |
 | **核心依赖** | ROS 2 (`rclcpp`, `std_msgs`), `pc_msgs` |
 
 ### 核心设计目标：
@@ -58,8 +58,8 @@
 
 | 节点 | 话题名称 | 通信方向 | 消息类型 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `mesh_publisher` | `mesh_topic` | 发布 (Publish) | [pc_msgs/msg/O3DMesh](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DMesh.msg) | 标准压力测试三角网格 |
-| `mesh_subscriber` | `mesh_topic` | 订阅 (Subscribe) | [pc_msgs/msg/O3DMesh](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DMesh.msg) | 接收并统计吞吐延迟 |
+| `mesh_publisher` | `mesh_topic` | 发布 (Publish) | [pc_msgs/msg/O3DMesh](../src/pc_msgs/msg/O3DMesh.msg) | 标准压力测试三角网格 |
+| `mesh_subscriber` | `mesh_topic` | 订阅 (Subscribe) | [pc_msgs/msg/O3DMesh](../src/pc_msgs/msg/O3DMesh.msg) | 接收并统计吞吐延迟 |
 
 ---
 

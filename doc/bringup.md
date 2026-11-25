@@ -10,7 +10,7 @@
 | :--- | :--- |
 | **功能包名称** | `bringup` |
 | **可执行文件** | `bringup_node` |
-| **主 C++ 类** | `BringupNode` ([bringup_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/bringup/src/bringup_node.cpp)) |
+| **主 C++ 类** | `BringupNode` ([bringup_node.cpp](../src/bringup/src/bringup_node.cpp)) |
 | **核心依赖** | ROS 2 (`rclcpp`), `pc_msgs` |
 
 ### 核心设计目标：
@@ -144,13 +144,13 @@
 
 | 话题名称 | 消息类型 | 说明 |
 | :--- | :--- | :--- |
-| `efficiency_monitor_topic` (配置指定) | [pc_msgs/msg/O3DMesh](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DMesh.msg) | 监控流水线端到端吞吐率的网格主题（单机/开发板 2 默认 `/flow/aligned_mesh`；开发板 1 默认 `/reconstruction/white_mesh`） |
+| `efficiency_monitor_topic` (配置指定) | [pc_msgs/msg/O3DMesh](../src/pc_msgs/msg/O3DMesh.msg) | 监控流水线端到端吞吐率的网格主题（单机/开发板 2 默认 `/flow/aligned_mesh`；开发板 1 默认 `/reconstruction/white_mesh`） |
 
 ---
 
 ## 5. 参数配置说明
 
-配置文件位于 [`src/bringup/config/`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/bringup/config/) 目录下。
+配置文件位于 [`src/bringup/config/`](../src/bringup/config/) 目录下。
 
 ### 5.1 全局控制参数
 
@@ -186,19 +186,19 @@
 
 `bringup` 原生提供了三份适配不同工况的配置文件：
 
-### 6.1 单机全量模式 ([bring_up.yaml](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/bringup/config/bring_up.yaml))
+### 6.1 单机全量模式 ([bring_up.yaml](../src/bringup/config/bring_up.yaml))
 * 启用全部 6 个节点。
 * 推荐启动优先级（消费者先就绪）：
   `visualization (1)` $\to$ `flow_alignment (2)` $\to$ `reconstruction (3)` $\to$ `clustering (4)` $\to$ `ground_segmentation (5)` $\to$ `io_handlers (6)`。
 * 效率监控主题：`/flow/aligned_mesh`。
 
-### 6.2 开发板 1 部署模式 ([bring_up_board1.yaml](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/bringup/config/bring_up_board1.yaml))
+### 6.2 开发板 1 部署模式 ([bring_up_board1.yaml](../src/bringup/config/bring_up_board1.yaml))
 * **任务范围**：数据输入、地面分割、聚类、白模重建。
 * **启用节点**：`reconstruction (1)` $\to$ `clustering (2)` $\to$ `ground_segmentation (3)` $\to$ `io_handlers (4)`。
 * **禁用节点**：`flow_alignment (false)`、`visualization (false)`。
 * **效率监控主题**：`/reconstruction/white_mesh`（统计开发板 1 的产出吞吐率）。
 
-### 6.3 开发板 2 部署模式 ([bring_up_board2.yaml](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/bringup/config/bring_up_board2.yaml))
+### 6.3 开发板 2 部署模式 ([bring_up_board2.yaml](../src/bringup/config/bring_up_board2.yaml))
 * **任务范围**：流式配准、三维渲染呈现。
 * **启用节点**：`visualization (1)` $\to$ `flow_alignment (2)`。
 * **禁用节点**：`io_handlers (false)`、`ground_segmentation (false)`、`clustering (false)`、`reconstruction (false)`。

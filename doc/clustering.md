@@ -10,7 +10,7 @@
 | :--- | :--- |
 | **功能包名称** | `clustering` |
 | **可执行文件** | `parallel_dbscan_node` |
-| **主 C++ 类** | `ParallelDbscanNode` ([parallel_dbscan_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/clustering/src/parallel_dbscan_node.cpp)) |
+| **主 C++ 类** | `ParallelDbscanNode` ([parallel_dbscan_node.cpp](../src/clustering/src/parallel_dbscan_node.cpp)) |
 | **核心依赖** | ROS 2 (`rclcpp`), `pc_msgs`, `Open3D`, `Eigen3` |
 
 ### 核心设计目标：
@@ -101,19 +101,19 @@ $$\text{extent}_l = \max(\Delta x_l, \Delta y_l, \Delta z_l)$$
 
 | 话题名称 | 消息类型 | 说明 |
 | :--- | :--- | :--- |
-| `subscribe_topic` (默认 `/gs/non_ground_pointcloud`) | [pc_msgs/msg/O3DPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) | 上游地面分割模块输出的悬浮非地面障碍物点云 |
+| `subscribe_topic` (默认 `/gs/non_ground_pointcloud`) | [pc_msgs/msg/O3DPointCloud](../src/pc_msgs/msg/O3DPointCloud.msg) | 上游地面分割模块输出的悬浮非地面障碍物点云 |
 
 ### 4.2 发布话题 (Published Topics)
 
 | 话题名称 | 消息类型 | 说明 |
 | :--- | :--- | :--- |
-| `publish_topic` (默认 `/clustering/clustered_pointcloud`) | [pc_msgs/msg/ClusteredPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/ClusteredPointCloud.msg) | 携带聚类类别标签（`labels`）的点云数据包 |
+| `publish_topic` (默认 `/clustering/clustered_pointcloud`) | [pc_msgs/msg/ClusteredPointCloud](../src/pc_msgs/msg/ClusteredPointCloud.msg) | 携带聚类类别标签（`labels`）的点云数据包 |
 
 ---
 
 ## 5. 参数配置说明
 
-配置文件位于 [`src/clustering/config/c_config.yaml`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/clustering/config/c_config.yaml)。
+配置文件位于 [`src/clustering/config/c_config.yaml`](../src/clustering/config/c_config.yaml)。
 
 | 参数名称 | 类型 | 默认值 | 参数功能说明 |
 | :--- | :--- | :--- | :--- |
@@ -133,7 +133,7 @@ $$\text{extent}_l = \max(\Delta x_l, \Delta y_l, \Delta z_l)$$
 
 ## 6. 常用配置与启动脚本
 
-### 6.1 启动脚本：[c_pdbscan.launch.py](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/clustering/launch/c_pdbscan.launch.py)
+### 6.1 启动脚本：[c_pdbscan.launch.py](../src/clustering/launch/c_pdbscan.launch.py)
 用于拉起 `parallel_dbscan_node`，自动加载 `c_config.yaml`。
 
 ---

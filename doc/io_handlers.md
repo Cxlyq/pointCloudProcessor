@@ -10,7 +10,7 @@
 | :--- | :--- |
 | **功能包名称** | `io_handlers` |
 | **可执行文件** | 1. `sim_lidar_data_flow_node`<br>2. `sim_plane_data_flow_node` |
-| **主 C++ 类** | 1. `IOHandlerNode` ([sim_lidar_data_flow_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/src/sim_lidar_data_flow_node.cpp))<br>2. `SimPlaneDataFlowNode` ([sim_plane_data_flow_node.cpp](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/src/sim_plane_data_flow_node.cpp)) |
+| **主 C++ 类** | 1. `IOHandlerNode` ([sim_lidar_data_flow_node.cpp](../src/io_handlers/src/sim_lidar_data_flow_node.cpp))<br>2. `SimPlaneDataFlowNode` ([sim_plane_data_flow_node.cpp](../src/io_handlers/src/sim_plane_data_flow_node.cpp)) |
 | **核心依赖** | ROS 2 (`rclcpp`), `pc_msgs`, `Open3D`, `nlohmann_json` (header-only) |
 
 ### 核心设计目标：
@@ -82,21 +82,21 @@ $$d = R \cdot \Delta\sigma$$
 
 | 节点 | 话题名称 | 消息类型 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `sim_lidar_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
-| `sim_plane_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
-| `sim_plane_data_flow_node` | `/io/plane/state` (可配) | [pc_msgs/msg/PlaneState](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/msg/PlaneState.msg) | 载机经纬度、海拔与航向状态 |
+| `sim_lidar_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](../src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
+| `sim_plane_data_flow_node` | `/io/raw_pointcloud` (可配) | [pc_msgs/msg/O3DPointCloud](../src/pc_msgs/msg/O3DPointCloud.msg) | 原始雷达点云序列 |
+| `sim_plane_data_flow_node` | `/io/plane/state` (可配) | [pc_msgs/msg/PlaneState](../src/pc_msgs/msg/PlaneState.msg) | 载机经纬度、海拔与航向状态 |
 
 ### 4.2 提供服务 (Services)
 
 | 节点 | 服务名称 | 服务类型 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `sim_plane_data_flow_node` | `/io/query_nearby_towers` (可配) | [pc_msgs/srv/QueryNearbyTowers](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/pc_msgs/srv/QueryNearbyTowers.srv) | 接收载机经纬度，返回范围内的所有高压铁塔列表 |
+| `sim_plane_data_flow_node` | `/io/query_nearby_towers` (可配) | [pc_msgs/srv/QueryNearbyTowers](../src/pc_msgs/srv/QueryNearbyTowers.srv) | 接收载机经纬度，返回范围内的所有高压铁塔列表 |
 
 ---
 
 ## 5. 参数配置说明
 
-配置文件位于 [`src/io_handlers/config/io_config.yaml`](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/config/io_config.yaml)。
+配置文件位于 [`src/io_handlers/config/io_config.yaml`](../src/io_handlers/config/io_config.yaml)。
 
 ### 5.1 `sim_lidar_data_flow_node` 参数
 
@@ -127,10 +127,10 @@ $$d = R \cdot \Delta\sigma$$
 
 功能包提供了两个开箱即用的 Launch 文件：
 
-### 6.1 纯点云数据回放：[io_simLidarDataFlow.launch.py](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/launch/io_simLidarDataFlow.launch.py)
+### 6.1 纯点云数据回放：[io_simLidarDataFlow.launch.py](../src/io_handlers/launch/io_simLidarDataFlow.launch.py)
 用于不需要载机轨迹或铁塔插入的常规单机测试。
 
-### 6.2 载机全模态数据回放：[io_simPlaneDataFlow.launch.py](file:///home/asahichinn/Documents/codes/pointCloudProcessor/src/io_handlers/launch/io_simPlaneDataFlow.launch.py)
+### 6.2 载机全模态数据回放：[io_simPlaneDataFlow.launch.py](../src/io_handlers/launch/io_simPlaneDataFlow.launch.py)
 用于配合带高压塔白模注入的重建节点（`reconstruction_g_poisson_ng_obb_pt_node`），同时提供点云、GPS 轨迹和铁塔查询服务。
 
 ---
